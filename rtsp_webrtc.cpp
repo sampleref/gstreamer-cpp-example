@@ -417,7 +417,7 @@ uridecodebin_element_added (GstBin * bin,
   if (g_strcmp0 (gst_plugin_feature_get_name (GST_PLUGIN_FEATURE
               (gst_element_get_factory (element))), "rtspsrc") == 0) {
 				  g_print ("Added latency 100 ms to rtspsrc\n");
-				g_object_set (G_OBJECT (element), "latency", 100,
+				g_object_set (G_OBJECT (element), "latency", 0,
 					"drop-on-latency", TRUE, NULL);
   }
 }
@@ -428,9 +428,10 @@ start_pipeline (void)
   GstStateChangeReturn ret;
   GError *error = NULL;
 
-  pipe1 =
-      gst_parse_launch ("uridecodebin name=uridb uri=rtsp://127.0.0.1:8554/test ! videoconvert ! queue ! x264enc ! rtph264pay ! queue ! application/x-rtp,media=video,encoding-name=H264,payload=96 ! webrtcbin name=sendrecv",
-      &error);
+  pipe1 = gst_parse_launch ("uridecodebin name=uridb uri=rtsp://127.0.0.1:8554/test ! videoconvert ! queue ! x264enc ! rtph264pay ! queue ! application/x-rtp,media=video,encoding-name=H264,payload=96 ! webrtcbin name=sendrecv", &error);
+
+  //Disable transcoding
+  //pipe1 = gst_parse_launch ("uridecodebin name=uridb uri=rtsp://127.0.0.1:8554/test ! rtph264pay ! queue ! application/x-rtp,media=video,encoding-name=H264,payload=96 ! webrtcbin name=sendrecv", &error);
 
   if (error) {
     g_printerr ("Failed to parse launch: %s\n", error->message);
@@ -441,6 +442,7 @@ start_pipeline (void)
   uridb1 = gst_bin_get_by_name (GST_BIN (pipe1), "uridb");
   GstCaps *deco_caps;
   deco_caps = gst_caps_from_string (KMS_AGNOSTIC_NO_RTP_CAPS);
+  //Disable transcoding
   //g_object_set (G_OBJECT (uridb1), "caps", deco_caps, NULL);
   gst_caps_unref (deco_caps);
 
