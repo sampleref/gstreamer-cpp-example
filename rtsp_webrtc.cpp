@@ -4,7 +4,7 @@
  *
  * gcc webrtc-sendrecv.c $(pkg-config --cflags --libs gstreamer-webrtc-1.0 gstreamer-sdp-1.0 libsoup-2.4 json-glib-1.0) -o webrtc-sendrecv
  *
- * Author: Nirbheek Chauhan <nirbheek@centricular.com>
+ * Thanks to: Nirbheek Chauhan <nirbheek@centricular.com> for example shared
  */
 #include <gst/gst.h>
 #include <gst/gstpromise.h>
