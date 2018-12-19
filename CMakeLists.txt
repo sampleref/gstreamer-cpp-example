@@ -34,11 +34,14 @@ include_directories(
 
 set(SOURCE_FILES main.cpp)
 set(SOURCE_FILES_WEBRTC rtsp_webrtc.cpp)
+set(SOURCE_FILES_WEBRTC_1_N rtsp_webrtc_1_n.cpp)
 
 link_directories(${GSTLIBS_LIBRARY_DIRS})
 
 add_executable(mainapp ${SOURCE_FILES})
 add_executable(rtsp2webrtc ${SOURCE_FILES_WEBRTC})
+add_executable(rtsp2webrtc_1_n ${SOURCE_FILES_WEBRTC_1_N})
 
 target_link_libraries(mainapp ${GSTLIBS_LIBRARIES})
 target_link_libraries(rtsp2webrtc ${GSTLIBS_LIBRARIES})
+target_link_libraries(rtsp2webrtc_1_n ${GSTLIBS_LIBRARIES})
