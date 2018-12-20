@@ -46,27 +46,25 @@ enum AppState {
     PEER_CALL_ERROR,
 };
 
-static GMainLoop *loop;
 static GstElement *pipe1;
-
 
 class WebrtcViewer {
 
 public:
+    //Attributes
     GstElement *webrtc1;
     GObject *send_channel, *receive_channel;
-
+    SoupSession *session;
     SoupWebsocketConnection *ws_conn = NULL;
     enum AppState app_state = APP_STATE_UNKNOWN;
     std::string peer_id;
     const gchar *server_url = "wss://127.0.0.1:8443";
     gboolean disable_ssl = FALSE;
 
+    //Methods
     gboolean start_webrtcbin(void);
     void remove_peer_from_pipeline (void);
-
     gboolean setup_call(void);
-
     void connect_to_websocket_server_async(void);
 };
 
@@ -516,12 +514,15 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
 gboolean WebrtcViewer::setup_call(void) {
     gchar *msg;
 
-    if (soup_websocket_connection_get_state(this->ws_conn) !=
-        SOUP_WEBSOCKET_STATE_OPEN)
+    if (soup_websocket_connection_get_state(this->ws_conn) != SOUP_WEBSOCKET_STATE_OPEN) {
+        g_print("Websocket connection is not in state SOUP_WEBSOCKET_STATE_OPEN \n");
         return FALSE;
+    }
 
-    if (this->peer_id == "")
+    if (this->peer_id == ""){
+        g_print("WebrtcViewer::setup_call peer id is blank\n");
         return FALSE;
+    }
 
     g_print("Setting up signalling server call with %s\n", this->peer_id.c_str());
     app_state = PEER_CONNECTING;
@@ -747,7 +748,6 @@ on_server_connected(SoupSession *session, GAsyncResult *res,
 void WebrtcViewer::connect_to_websocket_server_async(void) {
     SoupLogger *logger;
     SoupMessage *message;
-    SoupSession *session;
     const char *https_aliases[] = {"wss", NULL};
 
     session = soup_session_new_with_options(SOUP_SESSION_SSL_STRICT, !disable_ssl,
@@ -839,40 +839,20 @@ start_pipeline (std::string rtsp_url)
     return FALSE;
 }
 
+void * webrtc_init_func(string *webrtcViewerRef) {
 
-static gboolean
-pipeline_cb_msgs (GstBus * bus, GstMessage * message, GMainLoop * app)
-{
-    GST_DEBUG ("got message %s",
-               gst_message_type_get_name (GST_MESSAGE_TYPE (message)));
-
-    switch (GST_MESSAGE_TYPE (message)) {
-        case GST_MESSAGE_ERROR: {
-            GError *err = NULL;
-            gchar *dbg_info = NULL;
-
-            gst_message_parse_error (message, &err, &dbg_info);
-            g_printerr ("ERROR from element %s: %s\n",
-                        GST_OBJECT_NAME (message->src), err->message);
-            g_printerr ("Debugging info: %s\n", (dbg_info) ? dbg_info : "none");
-            g_error_free (err);
-            g_free (dbg_info);
-            g_main_loop_quit (loop);
-            break;
-        }
-        case GST_MESSAGE_EOS:
-            g_main_loop_quit (loop);
-            break;
-        default:
-            //g_print ("default\n");
-            break;
-    }
-    return TRUE;
-}
-
-void main_loop_func() {
-    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+    GMainContext *async_context = g_main_context_new ();
+    GMainLoop *loop = g_main_loop_new(async_context, FALSE);
+    g_main_context_push_thread_default (async_context);
+    WebrtcViewer webrtcViewer = WebrtcViewer();
+    webrtcViewer.peer_id = *webrtcViewerRef;
+    webrtcViewer.disable_ssl = TRUE;
+    g_print("Creating webrtc bin for remote peer %s\n", webrtcViewer.peer_id.c_str());
+    webrtcViewer.connect_to_websocket_server_async();
     g_main_loop_run(loop);
+    g_main_context_pop_thread_default (async_context);
+    g_main_loop_unref(loop);
+    g_main_context_unref (async_context);
 }
 
 int
@@ -898,30 +878,24 @@ main(int argc, char *argv[]) {
     //cout << "Please enter rtsp url";
     //getline(cin, rtsp_url);
     if(rtsp_url == ""){
-        //Default
         rtsp_url.assign("rtsp://127.0.0.1:8554/test");
     }
     start_pipeline(rtsp_url);
-    GThread* thread = g_thread_new(NULL, (GThreadFunc)main_loop_func, NULL);
 
     if(pipe1 == NULL){
-        g_print("Pipeline cannot be created ");
+        g_print("Pipeline cannot be created \n");
         return 0;
     }
-    //loop = g_main_loop_new(NULL, FALSE);
-    bus = gst_pipeline_get_bus (GST_PIPELINE (pipe1));
-    g_assert(bus);
 
-    /* add watch for messages */
-    gst_bus_add_watch (bus, (GstBusFunc) pipeline_cb_msgs, loop);
-
-    std::list<WebrtcViewer> viewers;
+    std::list<string *> peers;
     //loop for peers
     while (true){
+        cout << "Please enter a peer id: \n";
         WebrtcViewer webrtcViewerObj = WebrtcViewer();
-        //cout << "Please enter a peer id: ";
-        //getline(cin, webrtcViewerObj.peer_id);
-        webrtcViewerObj.peer_id.assign("5032");
+        std::string peer_id;
+        getline(cin, peer_id);
+        webrtcViewerObj.peer_id = peer_id;
+        //webrtcViewerObj.peer_id.assign("2344");
         if (webrtcViewerObj.peer_id == "") {
             g_printerr("peer-id is a required argument\n");
             continue;
@@ -940,19 +914,16 @@ main(int argc, char *argv[]) {
                 webrtcViewerObj.disable_ssl = TRUE;
             gst_uri_unref(uri);
         }
-        webrtcViewerObj.connect_to_websocket_server_async();
-        viewers.push_back(webrtcViewerObj);
+        peers.push_back(&webrtcViewerObj.peer_id);
+        g_thread_new("webrtc peer thread", (GThreadFunc)&webrtc_init_func, &webrtcViewerObj.peer_id);
+        //webrtc_init_func(&webrtcViewerObj);
     }
 
-    //g_main_loop_run(loop);
-    gst_object_unref (bus);
-    g_main_loop_unref(loop);
-
+    //gst_object_unref (bus);
     if (pipe1) {
         gst_element_set_state(GST_ELEMENT (pipe1), GST_STATE_NULL);
         g_print("Pipeline stopped\n");
         gst_object_unref(pipe1);
     }
-
     return 0;
 }
