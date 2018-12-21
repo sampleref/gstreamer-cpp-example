@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <execinfo.h>
 #include <signal.h>
+#include <time.h>
 #include <string>
 #include <iostream>
 #include <list>
@@ -811,40 +812,6 @@ void handler(int sig) {
     exit(1);
 }
 
-static gboolean
-start_pipeline(std::string rtsp_url) {
-    GstStateChangeReturn ret;
-    GError *error = NULL;
-
-    /* NOTE: webrtcbin currently does not support dynamic addition/removal of
-     * streams, so we use a separate webrtcbin for each peer, but all of them are
-     * inside the same pipeline. We start by connecting it to a fakesink so that
-     * we can preroll early. */
-    std::string pipeline_string = string("tee name=videotee ! queue ! fakesink ") +
-                                  string("rtspsrc location=" + rtsp_url +
-                                         " latency=10 drop-on-latency=TRUE ! rtph264depay ! videotee. ");
-    pipe1 = gst_parse_launch(pipeline_string.c_str(), &error);
-
-    if (error) {
-        g_printerr("Failed to parse launch: %s\n", error->message);
-        g_error_free(error);
-        goto err;
-    }
-
-    g_print("Starting pipeline, not transmitting yet\n");
-    ret = gst_element_set_state(GST_ELEMENT (pipe1), GST_STATE_PLAYING);
-    if (ret == GST_STATE_CHANGE_FAILURE)
-        goto err;
-
-    return TRUE;
-
-    err:
-    g_print("State change failure\n");
-    if (pipe1)
-        g_clear_object (&pipe1);
-    return FALSE;
-}
-
 class WebRTC_Launch_Task {
 public:
     void execute(std::string peer_id) {
@@ -866,6 +833,150 @@ public:
 
 };
 
+static void start_recording_video(std::string file_path) {
+    g_print("start_recording_video file to %s\n", file_path.c_str());
+
+    int ret;
+    gchar *tmp;
+    GstElement *tee, *queue, *h264parse, *mp4mux, *filesink;
+    GstPad *srcpad, *sinkpad;
+
+    //Create queue
+    tmp = g_strdup_printf("queue-%s", "recorder");
+    queue = gst_element_factory_make("queue", tmp);
+    g_free(tmp);
+
+    //Create h264parse
+    tmp = g_strdup_printf("h264parse-%s", "recorder");
+    h264parse = gst_element_factory_make("h264parse", tmp);
+    g_free(tmp);
+
+    //Create mp4mux
+    tmp = g_strdup_printf("mp4mux-%s", "recorder");
+    mp4mux = gst_element_factory_make("mp4mux", tmp);
+    g_free(tmp);
+
+    //Create filesink
+    tmp = g_strdup_printf("filesink-%s", "recorder");
+    filesink = gst_element_factory_make("filesink", tmp);
+    g_object_set(filesink, "location", file_path.c_str(), NULL);
+    g_free(tmp);
+
+    //Add elements to pipeline
+    gst_bin_add_many(GST_BIN (pipe1), queue, h264parse, mp4mux, filesink, NULL);
+
+    //Link queue -> h264parse
+    srcpad = gst_element_get_static_pad(queue, "src");
+    g_assert_nonnull (srcpad);
+    sinkpad = gst_element_get_static_pad(h264parse, "sink");
+    g_assert_nonnull (sinkpad);
+    ret = gst_pad_link(srcpad, sinkpad);
+    g_assert_cmpint (ret, ==, GST_PAD_LINK_OK);
+    gst_object_unref(srcpad);
+    gst_object_unref(sinkpad);
+
+    //Link h264parse -> mp4mux
+    srcpad = gst_element_get_static_pad(h264parse, "src");
+    g_assert_nonnull (srcpad);
+    sinkpad = gst_element_get_request_pad(mp4mux, "video_%u");
+    g_assert_nonnull (sinkpad);
+    ret = gst_pad_link(srcpad, sinkpad);
+    g_assert_cmpint (ret, ==, GST_PAD_LINK_OK);
+    gst_object_unref(srcpad);
+    gst_object_unref(sinkpad);
+
+    //Link mp4mux -> filesink
+    srcpad = gst_element_get_static_pad(mp4mux, "src");
+    g_assert_nonnull (srcpad);
+    sinkpad = gst_element_get_static_pad(filesink, "sink");
+    g_assert_nonnull (sinkpad);
+    ret = gst_pad_link(srcpad, sinkpad);
+    g_assert_cmpint (ret, ==, GST_PAD_LINK_OK);
+    gst_object_unref(srcpad);
+    gst_object_unref(sinkpad);
+
+    //Link videotee -> queue
+    tee = gst_bin_get_by_name(GST_BIN (pipe1), "videotee");
+    g_assert_nonnull (tee);
+    srcpad = gst_element_get_request_pad(tee, "src_%u");
+    g_assert_nonnull (srcpad);
+    gst_object_unref(tee);
+    sinkpad = gst_element_get_static_pad(queue, "sink");
+    g_assert_nonnull (sinkpad);
+    ret = gst_pad_link(srcpad, sinkpad);
+    g_assert_cmpint (ret, ==, GST_PAD_LINK_OK);
+    gst_object_unref(srcpad);
+    gst_object_unref(sinkpad);
+
+    g_assert_nonnull (filesink);
+
+    ret = gst_element_sync_state_with_parent(queue);
+    g_assert_true (ret);
+    ret = gst_element_sync_state_with_parent(h264parse);
+    g_assert_true (ret);
+    ret = gst_element_sync_state_with_parent(mp4mux);
+    g_assert_true (ret);
+    ret = gst_element_sync_state_with_parent(filesink);
+    g_assert_true (ret);
+
+    g_print("Recording file to %s\n", file_path.c_str());
+}
+
+static gboolean
+start_pipeline(std::string rtsp_url, std::string file_path) {
+    GstStateChangeReturn ret;
+    GError *error = NULL;
+
+    /* NOTE: webrtcbin currently does not support dynamic addition/removal of
+     * streams, so we use a separate webrtcbin for each peer, but all of them are
+     * inside the same pipeline. We start by connecting it to a fakesink so that
+     * we can preroll early. */
+    std::string pipeline_string = string("tee name=videotee ! queue ! fakesink ") +
+                                  string("rtspsrc location=" + rtsp_url +
+                                         " latency=10 drop-on-latency=TRUE ! rtph264depay ! videotee. ");
+
+    pipe1 = gst_parse_launch(pipeline_string.c_str(), &error);
+
+    if (error) {
+        g_printerr("Failed to parse launch: %s\n", error->message);
+        g_error_free(error);
+        goto err;
+    }
+
+    start_recording_video(file_path); //Need to check this
+    g_print("Starting pipeline, not transmitting yet\n");
+    ret = gst_element_set_state(GST_ELEMENT (pipe1), GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE)
+        goto err;
+
+    return TRUE;
+
+    err:
+    g_print("State change failure\n");
+    if (pipe1)
+        g_clear_object (&pipe1);
+    return FALSE;
+}
+
+void stop_recording_video() {
+    g_print("stop_recording_video file \n");
+    GstElement *queue;
+    GstPad *queue_src_pad;
+
+    queue = gst_bin_get_by_name(GST_BIN (pipe1), "queue-recorder");
+    queue_src_pad = gst_element_get_static_pad(queue, "sink");
+    g_print("pushing EOS event on pad %s:%s\n", GST_DEBUG_PAD_NAME (queue_src_pad));
+
+    /* tell pipeline to forward EOS message from filesink immediately and not
+     * hold it back until it also got an EOS message from the video sink */
+    g_object_set(pipe1, "message-forward", TRUE, NULL);
+
+    gst_pad_send_event(queue_src_pad, gst_event_new_eos());
+    gst_object_unref(queue_src_pad);
+    gst_object_unref(queue);
+    g_print("stopped_recording_video file \n");
+}
+
 int
 main(int argc, char *argv[]) {
     signal(SIGSEGV, handler);
@@ -883,15 +994,32 @@ main(int argc, char *argv[]) {
     if (!check_plugins())
         return -1;
 
-    //Start base pipeline
+    //Take input rtsp
     std::string rtsp_url;
     cout << "Please enter rtsp url";
     getline(cin, rtsp_url);
     if (rtsp_url == "") {
+        g_print("Using default rtsp url %s\n", "rtsp://127.0.0.1:8554/test");
         rtsp_url.assign("rtsp://127.0.0.1:8554/test");
+    } else {
+        g_print("Using rtsp url %s\n", rtsp_url.c_str());
     }
-    start_pipeline(rtsp_url);
 
+    //take input file name
+    std::string file_name;
+    cout << "Please enter recording file name";
+    getline(cin, file_name);
+    if (file_name == "") {
+        g_print("Using default file_name %s\n", "test_video");
+        file_name.assign("test_video");
+    }
+    file_name.insert(0, "/home/kantipud/videos/");
+    srand(time(0));
+    file_name.append(std::to_string(rand()));
+    file_name.append(".mp4");
+
+    //Start base pipeline
+    start_pipeline(rtsp_url, file_name);
     if (pipe1 == NULL) {
         g_print("Pipeline cannot be created \n");
         return 0;
@@ -928,6 +1056,8 @@ main(int argc, char *argv[]) {
         th.detach();
     }
 
+    stop_recording_video();
+    std::this_thread::sleep_for(std::chrono::seconds(2));
     //gst_object_unref (bus);
     if (pipe1) {
         gst_element_set_state(GST_ELEMENT (pipe1), GST_STATE_NULL);
