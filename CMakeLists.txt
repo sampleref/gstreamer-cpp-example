@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
 project(DemoCpp)
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(GSTLIBS REQUIRED
         gobject-2.0
         glib-2.0
@@ -44,4 +45,4 @@ add_executable(rtsp2webrtc_1_n ${SOURCE_FILES_WEBRTC_1_N})
 
 target_link_libraries(mainapp ${GSTLIBS_LIBRARIES})
 target_link_libraries(rtsp2webrtc ${GSTLIBS_LIBRARIES})
-target_link_libraries(rtsp2webrtc_1_n ${GSTLIBS_LIBRARIES})
+target_link_libraries(rtsp2webrtc_1_n ${GSTLIBS_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})

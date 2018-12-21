@@ -24,6 +24,8 @@
 #include <string>
 #include <iostream>
 #include <list>
+#include <thread>
+
 using namespace std;
 
 enum AppState {
@@ -60,11 +62,15 @@ public:
     std::string peer_id;
     const gchar *server_url = "wss://127.0.0.1:8443";
     gboolean disable_ssl = FALSE;
+    GMainLoop *loop;
 
     //Methods
     gboolean start_webrtcbin(void);
-    void remove_peer_from_pipeline (void);
+
+    void remove_peer_from_pipeline(void);
+
     gboolean setup_call(void);
+
     void connect_to_websocket_server_async(void);
 };
 
@@ -345,47 +351,47 @@ on_data_channel(GstElement *webrtc, GObject *data_channel, gpointer user_data) {
     static_cast<WebrtcViewer *>(user_data)->receive_channel = data_channel;
 }
 
-void WebrtcViewer::remove_peer_from_pipeline (void)
-{
+void WebrtcViewer::remove_peer_from_pipeline(void) {
     gchar *tmp;
     GstPad *srcpad, *sinkpad;
     GstElement *webrtc, *rtph264pay, *queue, *tee;
 
-    webrtc = gst_bin_get_by_name (GST_BIN (pipe1), this->peer_id.c_str());
+    webrtc = gst_bin_get_by_name(GST_BIN (pipe1), this->peer_id.c_str());
     if (!webrtc)
         return;
 
-    gst_bin_remove (GST_BIN (pipe1), webrtc);
-    gst_object_unref (webrtc);
+    gst_bin_remove(GST_BIN (pipe1), webrtc);
+    gst_object_unref(webrtc);
 
-    tmp = g_strdup_printf ("rtph264pay-%s", this->peer_id.c_str());
-    rtph264pay = gst_bin_get_by_name (GST_BIN (pipe1), tmp);
-    g_free (tmp);
-    if(rtph264pay){
+    tmp = g_strdup_printf("rtph264pay-%s", this->peer_id.c_str());
+    rtph264pay = gst_bin_get_by_name(GST_BIN (pipe1), tmp);
+    g_free(tmp);
+    if (rtph264pay) {
         gst_bin_remove(GST_BIN(pipe1), rtph264pay);
         gst_object_unref(rtph264pay);
     }
 
-    tmp = g_strdup_printf ("queue-%s", this->peer_id.c_str());
-    queue = gst_bin_get_by_name (GST_BIN (pipe1), tmp);
-    g_free (tmp);
+    tmp = g_strdup_printf("queue-%s", this->peer_id.c_str());
+    queue = gst_bin_get_by_name(GST_BIN (pipe1), tmp);
+    g_free(tmp);
 
-    sinkpad = gst_element_get_static_pad (queue, "sink");
+    sinkpad = gst_element_get_static_pad(queue, "sink");
     g_assert_nonnull (sinkpad);
-    srcpad = gst_pad_get_peer (sinkpad);
+    srcpad = gst_pad_get_peer(sinkpad);
     g_assert_nonnull (srcpad);
-    gst_object_unref (sinkpad);
+    gst_object_unref(sinkpad);
 
-    gst_bin_remove (GST_BIN (pipe1), queue);
-    gst_object_unref (queue);
+    gst_bin_remove(GST_BIN (pipe1), queue);
+    gst_object_unref(queue);
 
-    tee = gst_bin_get_by_name (GST_BIN (pipe1), "videotee");
+    tee = gst_bin_get_by_name(GST_BIN (pipe1), "videotee");
     g_assert_nonnull (tee);
-    gst_element_release_request_pad (tee, srcpad);
-    gst_object_unref (srcpad);
-    gst_object_unref (tee);
+    gst_element_release_request_pad(tee, srcpad);
+    gst_object_unref(srcpad);
+    gst_object_unref(tee);
 
     g_print("Removed webrtcbin peer for remote peer : %s\n", this->peer_id.c_str());
+    g_main_quit(this->loop);
 }
 
 gboolean WebrtcViewer::start_webrtcbin(void) {
@@ -400,16 +406,16 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     GstPad *srcpad, *sinkpad;
 
     //Create queue
-    tmp = g_strdup_printf ("queue-%s", this->peer_id.c_str());
-    queue = gst_element_factory_make ("queue", tmp);
-    g_free (tmp);
+    tmp = g_strdup_printf("queue-%s", this->peer_id.c_str());
+    queue = gst_element_factory_make("queue", tmp);
+    g_free(tmp);
 
     //Create rtph264depay with caps
-    tmp = g_strdup_printf ("rtph264pay-%s", this->peer_id.c_str());
-    rtph264pay = gst_element_factory_make ("rtph264pay", tmp);
+    tmp = g_strdup_printf("rtph264pay-%s", this->peer_id.c_str());
+    rtph264pay = gst_element_factory_make("rtph264pay", tmp);
     g_object_set(rtph264pay, "config-interval", 1, NULL);
-    g_free (tmp);
-    srcpad = gst_element_get_static_pad (rtph264pay, "src");
+    g_free(tmp);
+    srcpad = gst_element_get_static_pad(rtph264pay, "src");
     caps = gst_caps_from_string("application/x-rtp,media=video,encoding-name=H264,payload=96");
     gst_pad_set_caps(srcpad, caps);
     gst_caps_unref(caps);
@@ -419,40 +425,40 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     this->webrtc1 = gst_element_factory_make("webrtcbin", this->peer_id.c_str());
 
     //Add elements to pipeline
-    gst_bin_add_many (GST_BIN (pipe1), queue, rtph264pay, this->webrtc1, NULL);
+    gst_bin_add_many(GST_BIN (pipe1), queue, rtph264pay, this->webrtc1, NULL);
 
     //Link queue -> rtph264depay
-    srcpad = gst_element_get_static_pad (queue, "src");
+    srcpad = gst_element_get_static_pad(queue, "src");
     g_assert_nonnull (srcpad);
-    sinkpad = gst_element_get_static_pad (rtph264pay, "sink");
+    sinkpad = gst_element_get_static_pad(rtph264pay, "sink");
     g_assert_nonnull (sinkpad);
-    ret = gst_pad_link (srcpad, sinkpad);
+    ret = gst_pad_link(srcpad, sinkpad);
     g_assert_cmpint (ret, ==, GST_PAD_LINK_OK);
-    gst_object_unref (srcpad);
-    gst_object_unref (sinkpad);
+    gst_object_unref(srcpad);
+    gst_object_unref(sinkpad);
 
     //Link rtph264depay -> webrtcbin
-    srcpad = gst_element_get_static_pad (rtph264pay, "src");
+    srcpad = gst_element_get_static_pad(rtph264pay, "src");
     g_assert_nonnull (srcpad);
-    sinkpad = gst_element_get_request_pad (this->webrtc1, "sink_%u");
+    sinkpad = gst_element_get_request_pad(this->webrtc1, "sink_%u");
     g_assert_nonnull (sinkpad);
-    ret = gst_pad_link (srcpad, sinkpad);
+    ret = gst_pad_link(srcpad, sinkpad);
     g_assert_cmpint (ret, ==, GST_PAD_LINK_OK);
-    gst_object_unref (srcpad);
-    gst_object_unref (sinkpad);
+    gst_object_unref(srcpad);
+    gst_object_unref(sinkpad);
 
     //Link videotee -> queue
-    tee = gst_bin_get_by_name (GST_BIN (pipe1), "videotee");
+    tee = gst_bin_get_by_name(GST_BIN (pipe1), "videotee");
     g_assert_nonnull (tee);
-    srcpad = gst_element_get_request_pad (tee, "src_%u");
+    srcpad = gst_element_get_request_pad(tee, "src_%u");
     g_assert_nonnull (srcpad);
-    gst_object_unref (tee);
-    sinkpad = gst_element_get_static_pad (queue, "sink");
+    gst_object_unref(tee);
+    sinkpad = gst_element_get_static_pad(queue, "sink");
     g_assert_nonnull (sinkpad);
-    ret = gst_pad_link (srcpad, sinkpad);
+    ret = gst_pad_link(srcpad, sinkpad);
     g_assert_cmpint (ret, ==, GST_PAD_LINK_OK);
-    gst_object_unref (srcpad);
-    gst_object_unref (sinkpad);
+    gst_object_unref(srcpad);
+    gst_object_unref(sinkpad);
 
     g_assert_nonnull (webrtc1);
 
@@ -496,11 +502,11 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     g_print("Created webrtc bin for peer %s\n", this->peer_id.c_str());
 
     /* Set to pipeline branch to PLAYING */
-    ret = gst_element_sync_state_with_parent (queue);
+    ret = gst_element_sync_state_with_parent(queue);
     g_assert_true (ret);
-    ret = gst_element_sync_state_with_parent (rtph264pay);
+    ret = gst_element_sync_state_with_parent(rtph264pay);
     g_assert_true (ret);
-    ret = gst_element_sync_state_with_parent (webrtc1);
+    ret = gst_element_sync_state_with_parent(webrtc1);
     g_assert_true (ret);
 
     return TRUE;
@@ -519,7 +525,7 @@ gboolean WebrtcViewer::setup_call(void) {
         return FALSE;
     }
 
-    if (this->peer_id == ""){
+    if (this->peer_id == "") {
         g_print("WebrtcViewer::setup_call peer id is blank\n");
         return FALSE;
     }
@@ -806,8 +812,7 @@ void handler(int sig) {
 }
 
 static gboolean
-start_pipeline (std::string rtsp_url)
-{
+start_pipeline(std::string rtsp_url) {
     GstStateChangeReturn ret;
     GError *error = NULL;
 
@@ -816,51 +821,56 @@ start_pipeline (std::string rtsp_url)
      * inside the same pipeline. We start by connecting it to a fakesink so that
      * we can preroll early. */
     std::string pipeline_string = string("tee name=videotee ! queue ! fakesink ") +
-                                  string("rtspsrc location=" + rtsp_url + " latency=10 drop-on-latency=TRUE ! rtph264depay ! videotee. ");
-    pipe1 = gst_parse_launch (pipeline_string.c_str(), &error);
+                                  string("rtspsrc location=" + rtsp_url +
+                                         " latency=10 drop-on-latency=TRUE ! rtph264depay ! videotee. ");
+    pipe1 = gst_parse_launch(pipeline_string.c_str(), &error);
 
     if (error) {
-        g_printerr ("Failed to parse launch: %s\n", error->message);
-        g_error_free (error);
+        g_printerr("Failed to parse launch: %s\n", error->message);
+        g_error_free(error);
         goto err;
     }
 
-    g_print ("Starting pipeline, not transmitting yet\n");
-    ret = gst_element_set_state (GST_ELEMENT (pipe1), GST_STATE_PLAYING);
+    g_print("Starting pipeline, not transmitting yet\n");
+    ret = gst_element_set_state(GST_ELEMENT (pipe1), GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE)
         goto err;
 
     return TRUE;
 
     err:
-    g_print ("State change failure\n");
+    g_print("State change failure\n");
     if (pipe1)
         g_clear_object (&pipe1);
     return FALSE;
 }
 
-void * webrtc_init_func(string *webrtcViewerRef) {
+class WebRTC_Launch_Task {
+public:
+    void execute(std::string peer_id) {
+        GMainContext *async_context = g_main_context_new();
+        GMainLoop *loop = g_main_loop_new(async_context, FALSE);
+        g_main_context_push_thread_default(async_context);
+        WebrtcViewer webrtcViewer = WebrtcViewer();
+        webrtcViewer.peer_id = peer_id;
+        webrtcViewer.disable_ssl = TRUE;
+        webrtcViewer.loop = loop;
+        g_print("WebRTC_Launch_Task:execute Creating webrtc bin for remote peer %s\n", webrtcViewer.peer_id.c_str());
+        webrtcViewer.connect_to_websocket_server_async();
+        g_main_loop_run(loop);
+        g_main_context_pop_thread_default(async_context);
+        g_main_loop_unref(loop);
+        g_main_context_unref(async_context);
+        g_print("WebRTC_Launch_Task:execute Exited for remote peer %s\n", webrtcViewer.peer_id.c_str());
+    }
 
-    GMainContext *async_context = g_main_context_new ();
-    GMainLoop *loop = g_main_loop_new(async_context, FALSE);
-    g_main_context_push_thread_default (async_context);
-    WebrtcViewer webrtcViewer = WebrtcViewer();
-    webrtcViewer.peer_id = *webrtcViewerRef;
-    webrtcViewer.disable_ssl = TRUE;
-    g_print("Creating webrtc bin for remote peer %s\n", webrtcViewer.peer_id.c_str());
-    webrtcViewer.connect_to_websocket_server_async();
-    g_main_loop_run(loop);
-    g_main_context_pop_thread_default (async_context);
-    g_main_loop_unref(loop);
-    g_main_context_unref (async_context);
-}
+};
 
 int
 main(int argc, char *argv[]) {
     signal(SIGSEGV, handler);
     GOptionContext *context;
     GError *error = NULL;
-    GstBus *bus;
 
     context = g_option_context_new("- gstreamer rtsp -> webrtc demo");
 
@@ -875,32 +885,31 @@ main(int argc, char *argv[]) {
 
     //Start base pipeline
     std::string rtsp_url;
-    //cout << "Please enter rtsp url";
-    //getline(cin, rtsp_url);
-    if(rtsp_url == ""){
+    cout << "Please enter rtsp url";
+    getline(cin, rtsp_url);
+    if (rtsp_url == "") {
         rtsp_url.assign("rtsp://127.0.0.1:8554/test");
     }
     start_pipeline(rtsp_url);
 
-    if(pipe1 == NULL){
+    if (pipe1 == NULL) {
         g_print("Pipeline cannot be created \n");
         return 0;
     }
 
-    std::list<string *> peers;
+    //std::list<string *> peers;
     //loop for peers
-    while (true){
+    while (true) {
         cout << "Please enter a peer id: \n";
         WebrtcViewer webrtcViewerObj = WebrtcViewer();
         std::string peer_id;
         getline(cin, peer_id);
         webrtcViewerObj.peer_id = peer_id;
-        //webrtcViewerObj.peer_id.assign("2344");
         if (webrtcViewerObj.peer_id == "") {
             g_printerr("peer-id is a required argument\n");
             continue;
             //return -1;
-        } else if(webrtcViewerObj.peer_id == "exit"){
+        } else if (webrtcViewerObj.peer_id == "exit") {
             g_printerr("Exiting program \n");
             break;
             //return 0;
@@ -914,9 +923,9 @@ main(int argc, char *argv[]) {
                 webrtcViewerObj.disable_ssl = TRUE;
             gst_uri_unref(uri);
         }
-        peers.push_back(&webrtcViewerObj.peer_id);
-        g_thread_new("webrtc peer thread", (GThreadFunc)&webrtc_init_func, &webrtcViewerObj.peer_id);
-        //webrtc_init_func(&webrtcViewerObj);
+        WebRTC_Launch_Task *webRTC_launch_task = new WebRTC_Launch_Task();
+        std::thread th(&WebRTC_Launch_Task::execute, webRTC_launch_task, peer_id);
+        th.detach();
     }
 
     //gst_object_unref (bus);
