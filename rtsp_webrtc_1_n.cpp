@@ -21,6 +21,7 @@
 /* For application */
 #include <string.h>
 #include <stdio.h>
+#include <map>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
@@ -78,14 +79,15 @@ public:
     //Attributes
     GstElement *pipeline;
     GstElement *webrtc1;
+    GMainLoop *loop;
     GObject *send_channel, *receive_channel;
     SoupSession *session;
     SoupWebsocketConnection *ws_conn = NULL;
     enum AppState app_state = APP_STATE_UNKNOWN;
+    int pipeline_execution_id;
     std::string peer_id;
-    const gchar *server_url = SIGNAL_SERVER.c_str();
+    std::string server_url = SIGNAL_SERVER.c_str();
     gboolean disable_ssl = FALSE;
-    GMainLoop *loop;
 
     //Methods
     gboolean start_webrtcbin(void);
@@ -97,7 +99,11 @@ public:
     gboolean setup_call(void);
 
     void connect_to_websocket_server_async(void);
+
+    void remove_webrtc_peer_from_pipelinehandler_map();
 };
+
+typedef std::shared_ptr<WebrtcViewer> WebrtcViewerPtr;
 
 class RtspPipelineHandler {
 
@@ -108,8 +114,7 @@ public:
     std::string rtsp_url;
     int pipeline_execution_id;
     int current_file_index = 0;
-    std::list<WebrtcViewer> peers; //Connected webrtc peers
-
+    std::map<std::string, WebrtcViewerPtr> peers; //Connected webrtc peers with key as remote peer id
 
     //Methods
     gboolean start_streaming(void);
@@ -119,6 +124,21 @@ public:
     std::string prepare_next_file_name(void);
 
 };
+
+typedef std::shared_ptr<RtspPipelineHandler> RtspPipelineHandlerPtr;
+
+static std::map<int, RtspPipelineHandlerPtr> pipelineHandlers;
+
+void WebrtcViewer::remove_webrtc_peer_from_pipelinehandler_map() {
+    auto it_pipeline = pipelineHandlers.find(pipeline_execution_id);
+    if (it_pipeline != pipelineHandlers.end()) {
+        auto it_peer = it_pipeline->second->peers.find(peer_id);
+        if (it_peer != it_pipeline->second->peers.end()) {
+            it_pipeline->second->peers.erase(it_peer);
+            g_print("Deleted webrtc peer from map for peer %s\n", peer_id.c_str());
+        }
+    }
+}
 
 gboolean cleanup_and_quit_loop(const gchar *msg, enum AppState state, WebrtcViewer *webrtcViewer) {
     if (msg)
@@ -398,14 +418,17 @@ on_data_channel(GstElement *webrtc, GObject *data_channel, gpointer user_data) {
 
 void WebrtcViewer::close_peer_from_server(void) {
     g_print("Closing peer connection from server for: %s\n", peer_id.c_str());
-    if(session){
+    if (session) {
         g_print("Closing session for peer: %s\n", peer_id.c_str());
-        soup_session_abort(session);
+        //soup_session_abort(session);
+        g_object_unref(session);
     }
     std::string message = "Pipeline closed due to source disconnection, please retry and connect again";
     if (ws_conn) {
         g_print("Closing websocket connection for peer: %s\n", peer_id.c_str());
-        soup_websocket_connection_close(ws_conn, SOUP_WEBSOCKET_CLOSE_BAD_DATA, message.c_str());
+        if (soup_websocket_connection_get_state(ws_conn) == SOUP_WEBSOCKET_STATE_OPEN)
+            soup_websocket_connection_close(ws_conn, SOUP_WEBSOCKET_CLOSE_BAD_DATA, message.c_str());
+        g_object_unref(ws_conn);
     }
     remove_peer_from_pipeline();
     g_print("Closed peer connection from server for: %s\n", peer_id.c_str());
@@ -416,12 +439,19 @@ void WebrtcViewer::remove_peer_from_pipeline(void) {
     GstPad *srcpad, *sinkpad;
     GstElement *webrtc, *rtph264pay, *queue, *tee;
 
-    webrtc = gst_bin_get_by_name(GST_BIN (pipeline), this->peer_id.c_str());
-    if (!webrtc)
-        return;
+    if (webrtc1) {
+        gst_object_unref(webrtc1);
+    }
+    if (pipeline) {
+        gst_object_unref(pipeline);
+    }
 
-    gst_bin_remove(GST_BIN (pipeline), webrtc);
-    gst_object_unref(webrtc);
+    webrtc = gst_bin_get_by_name(GST_BIN (pipeline), this->peer_id.c_str());
+    if (webrtc) {
+        g_print("Removing existing webrtcbin for remote peer %s \n", this->peer_id.c_str());
+        gst_bin_remove(GST_BIN (pipeline), webrtc);
+        gst_object_unref(webrtc);
+    }
 
     tmp = g_strdup_printf("rtph264pay-%s", this->peer_id.c_str());
     rtph264pay = gst_bin_get_by_name(GST_BIN (pipeline), tmp);
@@ -435,23 +465,37 @@ void WebrtcViewer::remove_peer_from_pipeline(void) {
     queue = gst_bin_get_by_name(GST_BIN (pipeline), tmp);
     g_free(tmp);
 
-    sinkpad = gst_element_get_static_pad(queue, "sink");
-    g_assert_nonnull (sinkpad);
-    srcpad = gst_pad_get_peer(sinkpad);
-    g_assert_nonnull (srcpad);
-    gst_object_unref(sinkpad);
+    if (queue) {
+        gst_element_set_state(queue, GST_STATE_NULL);
 
-    gst_bin_remove(GST_BIN (pipeline), queue);
-    gst_object_unref(queue);
+        sinkpad = gst_element_get_static_pad(queue, "sink");
+        g_assert_nonnull (sinkpad);
+        srcpad = gst_pad_get_peer(sinkpad);
+        g_assert_nonnull (srcpad);
+        gst_object_unref(sinkpad);
 
-    tee = gst_bin_get_by_name(GST_BIN (pipeline), "videotee");
-    g_assert_nonnull (tee);
-    gst_element_release_request_pad(tee, srcpad);
-    gst_object_unref(srcpad);
-    gst_object_unref(tee);
+        gst_bin_remove(GST_BIN (pipeline), queue);
+        gst_object_unref(queue);
+
+        tee = gst_bin_get_by_name(GST_BIN (pipeline), "videotee");
+        if (tee) {
+            g_assert_nonnull (tee);
+            gst_element_release_request_pad(tee, srcpad);
+            gst_object_unref(srcpad);
+            gst_object_unref(tee);
+        }
+    }
+
+    if (loop) {
+        g_main_quit(this->loop);
+        g_object_unref(this->loop);
+    }
+
+    if (send_channel)
+        g_object_unref(send_channel);
 
     g_print("Removed webrtcbin peer for remote peer : %s\n", this->peer_id.c_str());
-    g_main_quit(this->loop);
+    remove_webrtc_peer_from_pipelinehandler_map();
 }
 
 gboolean WebrtcViewer::start_webrtcbin(void) {
@@ -825,7 +869,7 @@ void WebrtcViewer::connect_to_websocket_server_async(void) {
     soup_session_add_feature(session, SOUP_SESSION_FEATURE (logger));
     g_object_unref(logger);
 
-    message = soup_message_new(SOUP_METHOD_GET, server_url);
+    message = soup_message_new(SOUP_METHOD_GET, server_url.c_str());
 
     g_print("Connecting to server...\n");
 
@@ -873,24 +917,24 @@ void handler(int sig) {
 
 class WebRTC_Launch_Task {
 public:
-    void execute(WebrtcViewer webrtcViewer) {
+    void execute(WebrtcViewerPtr webrtcViewer) {
         GMainContext *async_context = g_main_context_new();
         GMainLoop *loop = g_main_loop_new(async_context, FALSE);
         g_main_context_push_thread_default(async_context);
-        webrtcViewer.disable_ssl = TRUE;
-        webrtcViewer.loop = loop;
-        g_print("WebRTC_Launch_Task:execute Creating webrtc bin for remote peer %s\n", webrtcViewer.peer_id.c_str());
-        webrtcViewer.connect_to_websocket_server_async();
+        webrtcViewer->disable_ssl = TRUE;
+        webrtcViewer->loop = loop;
+        g_print("WebRTC_Launch_Task:execute Creating webrtc bin for remote peer %s\n", webrtcViewer->peer_id.c_str());
+        webrtcViewer->connect_to_websocket_server_async();
         g_main_loop_run(loop);
         g_main_context_pop_thread_default(async_context);
         g_main_loop_unref(loop);
         g_main_context_unref(async_context);
-        g_print("WebRTC_Launch_Task:execute Exited for remote peer %s\n", webrtcViewer.peer_id.c_str());
+        g_print("WebRTC_Launch_Task:execute Exited for remote peer %s\n", webrtcViewer->peer_id.c_str());
     }
 
 };
 
-static int generate_random_int(void){
+static int generate_random_int(void) {
     srand(time(0));
     return rand();
 }
@@ -1135,6 +1179,17 @@ gboolean RtspPipelineHandler::stop_streaming() {
     gst_object_unref(queue);
     g_print("stopped_recording_video file \n");
 
+    auto it = pipelineHandlers.find(pipeline_execution_id);
+    if (it != pipelineHandlers.end()) {
+        for (auto elem : it->second->peers) {
+            WebrtcViewer webrtcViewer = *(elem.second);
+            webrtcViewer.close_peer_from_server();
+        }
+    }
+
+    peers.clear();
+    g_print("Removed peers for pipeline \n");
+
     std::this_thread::sleep_for(std::chrono::seconds(2));
     if (pipeline) {
         gst_element_set_state(GST_ELEMENT (pipeline), GST_STATE_NULL);
@@ -1142,12 +1197,27 @@ gboolean RtspPipelineHandler::stop_streaming() {
         gst_object_unref(pipeline);
     }
 
-    for (WebrtcViewer webrtcViewer : peers) {
-        webrtcViewer.close_peer_from_server();
-    }
-    peers.clear();
-    g_print("Removed peers for pipeline \n");
     return TRUE;
+}
+
+static void add_webrtc_peer(RtspPipelineHandlerPtr pipelineHandlerPtr, std::string peer_id) {
+    WebrtcViewerPtr webrtcViewerPtr = std::make_shared<WebrtcViewer>();
+    webrtcViewerPtr->peer_id = peer_id;
+    webrtcViewerPtr->pipeline = pipelineHandlerPtr->pipeline;
+    /* Disable ssl when running a localhost server, because
+    * it's probably a test server with a self-signed certificate */
+    {
+        GstUri *uri = gst_uri_from_string(webrtcViewerPtr->server_url.c_str());
+        if (g_strcmp0("localhost", gst_uri_get_host(uri)) == 0 ||
+            g_strcmp0("127.0.0.1", gst_uri_get_host(uri)) == 0)
+            webrtcViewerPtr->disable_ssl = TRUE;
+        gst_uri_unref(uri);
+    }
+    WebRTC_Launch_Task *webRTC_launch_task = new WebRTC_Launch_Task();
+    std::thread th(&WebRTC_Launch_Task::execute, webRTC_launch_task, webrtcViewerPtr);
+    th.detach();
+    webrtcViewerPtr->pipeline_execution_id = pipelineHandlerPtr->pipeline_execution_id;
+    pipelineHandlerPtr->peers[webrtcViewerPtr->peer_id] = webrtcViewerPtr;
 }
 
 int
@@ -1170,7 +1240,7 @@ main(int argc, char *argv[]) {
     //Take input rtsp
     std::string rtsp_url;
     cout << "Please enter rtsp url";
-    getline(cin, rtsp_url);
+    //getline(cin, rtsp_url);
     if (rtsp_url == "") {
         g_print("Using default rtsp url %s\n", "rtsp://127.0.0.1:8554/test");
         rtsp_url.assign("rtsp://127.0.0.1:8554/test");
@@ -1181,52 +1251,36 @@ main(int argc, char *argv[]) {
     //take input device name
     std::string device_name;
     cout << "Please enter device name";
-    getline(cin, device_name);
+    //getline(cin, device_name);
 
     //Start base pipeline
-    RtspPipelineHandler pipelineHandler = RtspPipelineHandler();
-    pipelineHandler.pipeline_execution_id = generate_random_int();
-    pipelineHandler.device_id = device_name;
-    pipelineHandler.rtsp_url = rtsp_url;
-    pipelineHandler.start_streaming();
-    if (pipelineHandler.pipeline == NULL) {
+    RtspPipelineHandlerPtr rtspPipelineHandlerPtr = std::make_shared<RtspPipelineHandler>();
+    rtspPipelineHandlerPtr->pipeline_execution_id = generate_random_int();
+    rtspPipelineHandlerPtr->device_id = device_name;
+    rtspPipelineHandlerPtr->rtsp_url = rtsp_url;
+    rtspPipelineHandlerPtr->start_streaming();
+    if (rtspPipelineHandlerPtr->pipeline == NULL) {
         g_print("Pipeline cannot be created \n");
         return 0;
     }
-
-    //std::list<string *> peers;
+    pipelineHandlers[rtspPipelineHandlerPtr->pipeline_execution_id] = rtspPipelineHandlerPtr;
     //loop for peers
     while (true) {
         cout << "Please enter a peer id: \n";
-        WebrtcViewer webrtcViewerObj = WebrtcViewer();
         std::string peer_id;
         getline(cin, peer_id);
-        webrtcViewerObj.peer_id = peer_id;
-        webrtcViewerObj.pipeline = pipelineHandler.pipeline;
-        if (webrtcViewerObj.peer_id == "") {
+        if (peer_id == "") {
             g_printerr("peer-id is a required argument\n");
             continue;
             //return -1;
-        } else if (webrtcViewerObj.peer_id == "exit") {
+        } else if (peer_id == "exit") {
             g_printerr("Exiting program \n");
             break;
             //return 0;
         }
-        /* Disable ssl when running a localhost server, because
-        * it's probably a test server with a self-signed certificate */
-        {
-            GstUri *uri = gst_uri_from_string(webrtcViewerObj.server_url);
-            if (g_strcmp0("localhost", gst_uri_get_host(uri)) == 0 ||
-                g_strcmp0("127.0.0.1", gst_uri_get_host(uri)) == 0)
-                webrtcViewerObj.disable_ssl = TRUE;
-            gst_uri_unref(uri);
-        }
-        WebRTC_Launch_Task *webRTC_launch_task = new WebRTC_Launch_Task();
-        std::thread th(&WebRTC_Launch_Task::execute, webRTC_launch_task, webrtcViewerObj);
-        th.detach();
-        pipelineHandler.peers.push_back(webrtcViewerObj);
+        add_webrtc_peer(rtspPipelineHandlerPtr, peer_id);
     }
-
-    pipelineHandler.stop_streaming();
+    //add_webrtc_peer(rtspPipelineHandlerPtr, "4615");
+    rtspPipelineHandlerPtr->stop_streaming();
     return 0;
 }
