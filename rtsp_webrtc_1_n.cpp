@@ -16,18 +16,41 @@
 /* For signalling */
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
+#include <libsoup/soup-websocket.h>
+
+/* For application */
 #include <string.h>
 #include <stdio.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <stdlib.h>
 #include <execinfo.h>
 #include <signal.h>
 #include <time.h>
 #include <string>
+#include <regex>
 #include <iostream>
 #include <list>
 #include <thread>
 
 using namespace std;
+
+//CONSTANTS
+const std::string LEVEL_ASYMMETRY_ALLOWED = ";level-asymmetry-allowed=1";
+const std::string PROFILE_LEVEL_ID_REGEX = "profile-level-id=*[A-za-z0-9]*;";
+const std::string H264_BROWSER_PROFILE_LEVEL_ID = "profile-level-id=42e01f;";
+const bool CHANGE_PROFILE_LEVEL_ID = true;
+
+const std::string BASE_RECORDING_PATH = "/home/kantipud/videos/";
+const std::string SIGNAL_SERVER = "wss://127.0.0.1:8443";
+
+#define STUN_SERVER " stun-server=stun://stun.l.google.com:19302 "
+#define RTP_CAPS_OPUS "application/x-rtp,media=audio,encoding-name=OPUS,payload="
+#define RTP_CAPS_VP8 "application/x-rtp,media=video,encoding-name=VP8,payload="
+#define RTP_CAPS_H264 "application/x-rtp,media=video,encoding-name=H264,payload=96"
+
 
 enum AppState {
     APP_STATE_UNKNOWN = 0,
@@ -49,19 +72,18 @@ enum AppState {
     PEER_CALL_ERROR,
 };
 
-static GstElement *pipe1;
-
 class WebrtcViewer {
 
 public:
     //Attributes
+    GstElement *pipeline;
     GstElement *webrtc1;
     GObject *send_channel, *receive_channel;
     SoupSession *session;
     SoupWebsocketConnection *ws_conn = NULL;
     enum AppState app_state = APP_STATE_UNKNOWN;
     std::string peer_id;
-    const gchar *server_url = "wss://127.0.0.1:8443";
+    const gchar *server_url = SIGNAL_SERVER.c_str();
     gboolean disable_ssl = FALSE;
     GMainLoop *loop;
 
@@ -70,11 +92,33 @@ public:
 
     void remove_peer_from_pipeline(void);
 
+    void close_peer_from_server(void);
+
     gboolean setup_call(void);
 
     void connect_to_websocket_server_async(void);
 };
 
+class RtspPipelineHandler {
+
+public:
+    //Attributes
+    GstElement *pipeline;
+    std::string device_id;
+    std::string rtsp_url;
+    int pipeline_execution_id;
+    int current_file_index = 0;
+    std::list<WebrtcViewer> peers; //Connected webrtc peers
+
+
+    //Methods
+    gboolean start_streaming(void);
+
+    gboolean stop_streaming(void);
+
+    std::string prepare_next_file_name(void);
+
+};
 
 gboolean cleanup_and_quit_loop(const gchar *msg, enum AppState state, WebrtcViewer *webrtcViewer) {
     if (msg)
@@ -255,40 +299,44 @@ static void on_offer_created(GstPromise *promise, gpointer user_data) {
     gst_promise_unref(promise);
 
 
-    const gchar *text_fmtp = gst_sdp_media_get_attribute_val(
-            (GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0), "fmtp");
-    if (strstr(text_fmtp, "profile-level-id") != NULL) {
-        g_print("Found Line containing profile-level-id ... \n");
-        char new_fmtp[strlen(text_fmtp)];
-        char *asymmetry_allowed = ";level-asymmetry-allowed=1";
-        strcpy(new_fmtp, text_fmtp);
-        strcat(new_fmtp, asymmetry_allowed);
-        printf("String obtained on fmtp concatenation: %s\n", new_fmtp);
+    if (CHANGE_PROFILE_LEVEL_ID) {
+        const gchar *text_fmtp = gst_sdp_media_get_attribute_val(
+                (GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0), "fmtp");
+        if (strstr(text_fmtp, "profile-level-id") != NULL) {
+            g_print("Found source fmtp attribute as:  %s\n", text_fmtp);
+            std::string delimiter = ";";
+            std::string fmtp_attr(text_fmtp);
+            fmtp_attr.append(LEVEL_ASYMMETRY_ALLOWED);
+            //Replacing profile-level-id
+            fmtp_attr = std::regex_replace(fmtp_attr, std::regex(PROFILE_LEVEL_ID_REGEX),
+                                           H264_BROWSER_PROFILE_LEVEL_ID);
+            printf("Updated fmtp attribute as: %s\n", fmtp_attr.c_str());
 
-        guint attr_len = gst_sdp_media_attributes_len(
-                (GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0));
-        printf("Attributes Length: %d\n", attr_len);
-        guint fmtp_index;
-        for (guint index = 0; index < attr_len; index++) {
-            const GstSDPAttribute *gstSDPAttribute = gst_sdp_media_get_attribute(
-                    (GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0), index);
-            const gchar *attr_val = gstSDPAttribute->value;
-            //printf("Fetched attribute value at index: %d as %s\n", index, attr_val);
-            if (attr_val != NULL && strstr(attr_val, "profile-level-id") != NULL) {
-                printf("Found fmtp index at: %d\n", index);
-                fmtp_index = index;
+            guint attr_len = gst_sdp_media_attributes_len(
+                    (GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0));
+            printf("Attributes Length: %d\n", attr_len);
+            guint fmtp_index;
+            for (guint index = 0; index < attr_len; index++) {
+                const GstSDPAttribute *gstSDPAttribute = gst_sdp_media_get_attribute(
+                        (GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0), index);
+                const gchar *attr_val = gstSDPAttribute->value;
+                if (attr_val != NULL && strstr(attr_val, "profile-level-id") != NULL) {
+                    printf("Found fmtp attribute at index: %d\n", index);
+                    fmtp_index = index;
+                }
+            }
+            if (fmtp_index > 0) {
+                printf("Replacing fmtp attribute at index: %d \n", fmtp_index);
+                gst_sdp_media_remove_attribute((GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0),
+                                               fmtp_index);
+                gst_sdp_media_add_attribute((GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0), "fmtp",
+                                            fmtp_attr.c_str());
+                //Frame rate hard code - Disabled
+                /*gst_sdp_media_add_attribute((GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0), "framerate", "29.985014985014985");*/
             }
         }
-        if (fmtp_index > 0) {
-            printf("Replacing index: %d \n", fmtp_index);
-            gst_sdp_media_remove_attribute((GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0),
-                                           fmtp_index);
-            gst_sdp_media_add_attribute((GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0), "fmtp",
-                                        "96 packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1;sprop-parameter-sets=Z0IAH5Y1QKALdgLcBAQFAAADA+kAAOpghA==,aM48gA==");
-            gst_sdp_media_add_attribute((GstSDPMedia *) &g_array_index(offer->sdp->medias, GstSDPMedia, 0), "framerate",
-                                        "29.985014985014985");
-        }
     }
+
 
     promise = gst_promise_new();
     g_signal_emit_by_name(webrtcViewer->webrtc1, "set-local-description", offer, promise);
@@ -307,10 +355,6 @@ void static on_negotiation_needed(GstElement *element, WebrtcViewer *user_data) 
     promise = gst_promise_new_with_change_func(on_offer_created, webrtcViewer, NULL);;
     g_signal_emit_by_name(webrtcViewer->webrtc1, "create-offer", NULL, promise);
 }
-
-#define STUN_SERVER " stun-server=stun://stun.l.google.com:19302 "
-#define RTP_CAPS_OPUS "application/x-rtp,media=audio,encoding-name=OPUS,payload="
-#define RTP_CAPS_VP8 "application/x-rtp,media=video,encoding-name=VP8,payload="
 
 void data_channel_on_error(GObject *dc, gpointer user_data) {
     cleanup_and_quit_loop("Data channel error", APP_STATE_UNKNOWN, static_cast<WebrtcViewer *>(user_data));
@@ -352,28 +396,43 @@ on_data_channel(GstElement *webrtc, GObject *data_channel, gpointer user_data) {
     static_cast<WebrtcViewer *>(user_data)->receive_channel = data_channel;
 }
 
+void WebrtcViewer::close_peer_from_server(void) {
+    g_print("Closing peer connection from server for: %s\n", peer_id.c_str());
+    if(session){
+        g_print("Closing session for peer: %s\n", peer_id.c_str());
+        soup_session_abort(session);
+    }
+    std::string message = "Pipeline closed due to source disconnection, please retry and connect again";
+    if (ws_conn) {
+        g_print("Closing websocket connection for peer: %s\n", peer_id.c_str());
+        soup_websocket_connection_close(ws_conn, SOUP_WEBSOCKET_CLOSE_BAD_DATA, message.c_str());
+    }
+    remove_peer_from_pipeline();
+    g_print("Closed peer connection from server for: %s\n", peer_id.c_str());
+}
+
 void WebrtcViewer::remove_peer_from_pipeline(void) {
     gchar *tmp;
     GstPad *srcpad, *sinkpad;
     GstElement *webrtc, *rtph264pay, *queue, *tee;
 
-    webrtc = gst_bin_get_by_name(GST_BIN (pipe1), this->peer_id.c_str());
+    webrtc = gst_bin_get_by_name(GST_BIN (pipeline), this->peer_id.c_str());
     if (!webrtc)
         return;
 
-    gst_bin_remove(GST_BIN (pipe1), webrtc);
+    gst_bin_remove(GST_BIN (pipeline), webrtc);
     gst_object_unref(webrtc);
 
     tmp = g_strdup_printf("rtph264pay-%s", this->peer_id.c_str());
-    rtph264pay = gst_bin_get_by_name(GST_BIN (pipe1), tmp);
+    rtph264pay = gst_bin_get_by_name(GST_BIN (pipeline), tmp);
     g_free(tmp);
     if (rtph264pay) {
-        gst_bin_remove(GST_BIN(pipe1), rtph264pay);
+        gst_bin_remove(GST_BIN(pipeline), rtph264pay);
         gst_object_unref(rtph264pay);
     }
 
     tmp = g_strdup_printf("queue-%s", this->peer_id.c_str());
-    queue = gst_bin_get_by_name(GST_BIN (pipe1), tmp);
+    queue = gst_bin_get_by_name(GST_BIN (pipeline), tmp);
     g_free(tmp);
 
     sinkpad = gst_element_get_static_pad(queue, "sink");
@@ -382,10 +441,10 @@ void WebrtcViewer::remove_peer_from_pipeline(void) {
     g_assert_nonnull (srcpad);
     gst_object_unref(sinkpad);
 
-    gst_bin_remove(GST_BIN (pipe1), queue);
+    gst_bin_remove(GST_BIN (pipeline), queue);
     gst_object_unref(queue);
 
-    tee = gst_bin_get_by_name(GST_BIN (pipe1), "videotee");
+    tee = gst_bin_get_by_name(GST_BIN (pipeline), "videotee");
     g_assert_nonnull (tee);
     gst_element_release_request_pad(tee, srcpad);
     gst_object_unref(srcpad);
@@ -417,7 +476,7 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     g_object_set(rtph264pay, "config-interval", 1, NULL);
     g_free(tmp);
     srcpad = gst_element_get_static_pad(rtph264pay, "src");
-    caps = gst_caps_from_string("application/x-rtp,media=video,encoding-name=H264,payload=96");
+    caps = gst_caps_from_string(RTP_CAPS_H264);
     gst_pad_set_caps(srcpad, caps);
     gst_caps_unref(caps);
     gst_object_unref(srcpad);
@@ -426,7 +485,7 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     this->webrtc1 = gst_element_factory_make("webrtcbin", this->peer_id.c_str());
 
     //Add elements to pipeline
-    gst_bin_add_many(GST_BIN (pipe1), queue, rtph264pay, this->webrtc1, NULL);
+    gst_bin_add_many(GST_BIN (pipeline), queue, rtph264pay, this->webrtc1, NULL);
 
     //Link queue -> rtph264depay
     srcpad = gst_element_get_static_pad(queue, "src");
@@ -449,7 +508,7 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     gst_object_unref(sinkpad);
 
     //Link videotee -> queue
-    tee = gst_bin_get_by_name(GST_BIN (pipe1), "videotee");
+    tee = gst_bin_get_by_name(GST_BIN (pipeline), "videotee");
     g_assert_nonnull (tee);
     srcpad = gst_element_get_request_pad(tee, "src_%u");
     g_assert_nonnull (srcpad);
@@ -498,7 +557,7 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
                       this);
     /* Incoming streams will be exposed via this signal */
     g_signal_connect (webrtc1, "pad-added", G_CALLBACK(on_incoming_stream),
-                      pipe1);
+                      pipeline);
 
     g_print("Created webrtc bin for peer %s\n", this->peer_id.c_str());
 
@@ -814,12 +873,10 @@ void handler(int sig) {
 
 class WebRTC_Launch_Task {
 public:
-    void execute(std::string peer_id) {
+    void execute(WebrtcViewer webrtcViewer) {
         GMainContext *async_context = g_main_context_new();
         GMainLoop *loop = g_main_loop_new(async_context, FALSE);
         g_main_context_push_thread_default(async_context);
-        WebrtcViewer webrtcViewer = WebrtcViewer();
-        webrtcViewer.peer_id = peer_id;
         webrtcViewer.disable_ssl = TRUE;
         webrtcViewer.loop = loop;
         g_print("WebRTC_Launch_Task:execute Creating webrtc bin for remote peer %s\n", webrtcViewer.peer_id.c_str());
@@ -833,7 +890,27 @@ public:
 
 };
 
-static void start_recording_video(std::string file_path) {
+static int generate_random_int(void){
+    srand(time(0));
+    return rand();
+}
+
+std::string RtspPipelineHandler::prepare_next_file_name(void) {
+    std::string file_name;
+    if (device_id == "") {
+        g_print("Using default device_name %s\n", "test_device");
+        device_id.assign("test_device");
+    }
+    file_name = device_id;
+    file_name.insert(0, BASE_RECORDING_PATH);
+    file_name.append("__" + std::to_string(pipeline_execution_id) + "-" + std::to_string(++current_file_index) + "__");
+    file_name.append(std::to_string(generate_random_int()));
+    file_name.append(".mp4");
+    g_print("New recording file name generated as: %s\n", file_name.c_str());
+    return file_name;
+}
+
+static void start_recording_video(std::string file_path, GstElement *pipe1) {
     g_print("start_recording_video file to %s\n", file_path.c_str());
 
     int ret;
@@ -849,6 +926,7 @@ static void start_recording_video(std::string file_path) {
     //Create h264parse
     tmp = g_strdup_printf("h264parse-%s", "recorder");
     h264parse = gst_element_factory_make("h264parse", tmp);
+    g_object_set(h264parse, "config-interval", 1, NULL);
     g_free(tmp);
 
     //Create mp4mux
@@ -922,20 +1000,94 @@ static void start_recording_video(std::string file_path) {
     g_print("Recording file to %s\n", file_path.c_str());
 }
 
-static gboolean
-start_pipeline(std::string rtsp_url, std::string file_path) {
+static gboolean check_rtsp_socket() {
+    g_print("Checking rtsp connection \n");
+    int CreateSocket = 0, n = 0;
+    char dataReceived[1024];
+    struct sockaddr_in ipOfServer;
+
+    memset(dataReceived, '0', sizeof(dataReceived));
+
+    if ((CreateSocket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("Socket not created \n");
+        return 1;
+    }
+
+    ipOfServer.sin_family = AF_INET;
+    ipOfServer.sin_port = htons(8554);
+    ipOfServer.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    if (connect(CreateSocket, (struct sockaddr *) &ipOfServer, sizeof(ipOfServer)) < 0) {
+        printf("Connection failed \n");
+        return false;
+    }
+    g_print("Checking rtsp connection - success \n");
+    return true;
+}
+
+static void pause_play_pipeline(gpointer data) {
+    RtspPipelineHandler *pipelineHandler = static_cast<RtspPipelineHandler *>(data);
+
+    if (pipelineHandler->stop_streaming()) {
+        GstStateChangeReturn ret = gst_element_set_state(pipelineHandler->pipeline, GST_STATE_NULL);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            g_printerr("pause_play_pipeline: Unable to set the pipeline to the NULL state.\n");
+        }
+    }
+    while (!check_rtsp_socket()) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    pipelineHandler->start_streaming();
+}
+
+static gboolean pipeline_bus_callback(GstBus *bus, GstMessage *message, gpointer data) {
+    switch (GST_MESSAGE_TYPE (message)) {
+        case GST_MESSAGE_ERROR: {
+            GError *err;
+            gchar *debug;
+            gst_message_parse_error(message, &err, &debug);
+            g_print("pipeline_bus_callback:GST_MESSAGE_ERROR Error/code : %s/%d\n", err->message, err->code);
+            if (err->code == 7) {
+                pause_play_pipeline(data);
+                g_error_free(err);
+                g_free(debug);
+                return FALSE;
+            }
+            g_error_free(err);
+            g_free(debug);
+            break;
+        }
+        case GST_MESSAGE_EOS: {
+            GError *err;
+            gchar *debug;
+            gst_message_parse_error(message, &err, &debug);
+            g_print("pipeline_bus_callback:GST_MESSAGE_ERROR Error/code : %s/%d\n", err->message, err->code);
+            g_error_free(err);
+            g_free(debug);
+            break;
+        }
+        default: {
+            //g_print("pipeline_bus_callback:default Got %s message \n", GST_MESSAGE_TYPE_NAME (message));
+            break;
+        }
+    }
+    return TRUE;
+}
+
+gboolean RtspPipelineHandler::start_streaming() {
     GstStateChangeReturn ret;
     GError *error = NULL;
+    GstBus *bus;
 
     /* NOTE: webrtcbin currently does not support dynamic addition/removal of
      * streams, so we use a separate webrtcbin for each peer, but all of them are
      * inside the same pipeline. We start by connecting it to a fakesink so that
      * we can preroll early. */
     std::string pipeline_string = string("tee name=videotee ! queue ! fakesink ") +
-                                  string("rtspsrc location=" + rtsp_url +
-                                         " latency=10 drop-on-latency=TRUE ! rtph264depay ! videotee. ");
+                                  string("rtspsrc name=rtspsource location=" + rtsp_url +
+                                         " latency=10 drop-on-latency=TRUE ! rtph264depay name=rtspdepay ! videotee. ");
 
-    pipe1 = gst_parse_launch(pipeline_string.c_str(), &error);
+    pipeline = gst_parse_launch(pipeline_string.c_str(), &error);
 
     if (error) {
         g_printerr("Failed to parse launch: %s\n", error->message);
@@ -943,38 +1095,59 @@ start_pipeline(std::string rtsp_url, std::string file_path) {
         goto err;
     }
 
-    start_recording_video(file_path); //Need to check this
+    bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
+    gst_bus_enable_sync_message_emission(bus);
+    gst_bus_set_sync_handler(bus, (GstBusSyncHandler) pipeline_bus_callback, this, NULL);
+    gst_object_unref(GST_OBJECT(bus));
+
+    start_recording_video(prepare_next_file_name(), pipeline); //Need to check this
+
     g_print("Starting pipeline, not transmitting yet\n");
-    ret = gst_element_set_state(GST_ELEMENT (pipe1), GST_STATE_PLAYING);
+    ret = gst_element_set_state(GST_ELEMENT (pipeline), GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE)
         goto err;
 
+    g_print("Started pipeline, try adding peers \n");
     return TRUE;
 
     err:
     g_print("State change failure\n");
-    if (pipe1)
-        g_clear_object (&pipe1);
+    if (pipeline)
+        g_clear_object (&pipeline);
     return FALSE;
 }
 
-void stop_recording_video() {
+gboolean RtspPipelineHandler::stop_streaming() {
     g_print("stop_recording_video file \n");
     GstElement *queue;
     GstPad *queue_src_pad;
 
-    queue = gst_bin_get_by_name(GST_BIN (pipe1), "queue-recorder");
+    queue = gst_bin_get_by_name(GST_BIN (pipeline), "queue-recorder");
     queue_src_pad = gst_element_get_static_pad(queue, "sink");
     g_print("pushing EOS event on pad %s:%s\n", GST_DEBUG_PAD_NAME (queue_src_pad));
 
     /* tell pipeline to forward EOS message from filesink immediately and not
      * hold it back until it also got an EOS message from the video sink */
-    g_object_set(pipe1, "message-forward", TRUE, NULL);
+    g_object_set(pipeline, "message-forward", TRUE, NULL);
 
     gst_pad_send_event(queue_src_pad, gst_event_new_eos());
     gst_object_unref(queue_src_pad);
     gst_object_unref(queue);
     g_print("stopped_recording_video file \n");
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    if (pipeline) {
+        gst_element_set_state(GST_ELEMENT (pipeline), GST_STATE_NULL);
+        g_print("Pipeline stopped for rtsp url %s\n", rtsp_url.c_str());
+        gst_object_unref(pipeline);
+    }
+
+    for (WebrtcViewer webrtcViewer : peers) {
+        webrtcViewer.close_peer_from_server();
+    }
+    peers.clear();
+    g_print("Removed peers for pipeline \n");
+    return TRUE;
 }
 
 int
@@ -1005,22 +1178,18 @@ main(int argc, char *argv[]) {
         g_print("Using rtsp url %s\n", rtsp_url.c_str());
     }
 
-    //take input file name
-    std::string file_name;
-    cout << "Please enter recording file name";
-    getline(cin, file_name);
-    if (file_name == "") {
-        g_print("Using default file_name %s\n", "test_video");
-        file_name.assign("test_video");
-    }
-    file_name.insert(0, "/home/kantipud/videos/");
-    srand(time(0));
-    file_name.append(std::to_string(rand()));
-    file_name.append(".mp4");
+    //take input device name
+    std::string device_name;
+    cout << "Please enter device name";
+    getline(cin, device_name);
 
     //Start base pipeline
-    start_pipeline(rtsp_url, file_name);
-    if (pipe1 == NULL) {
+    RtspPipelineHandler pipelineHandler = RtspPipelineHandler();
+    pipelineHandler.pipeline_execution_id = generate_random_int();
+    pipelineHandler.device_id = device_name;
+    pipelineHandler.rtsp_url = rtsp_url;
+    pipelineHandler.start_streaming();
+    if (pipelineHandler.pipeline == NULL) {
         g_print("Pipeline cannot be created \n");
         return 0;
     }
@@ -1033,6 +1202,7 @@ main(int argc, char *argv[]) {
         std::string peer_id;
         getline(cin, peer_id);
         webrtcViewerObj.peer_id = peer_id;
+        webrtcViewerObj.pipeline = pipelineHandler.pipeline;
         if (webrtcViewerObj.peer_id == "") {
             g_printerr("peer-id is a required argument\n");
             continue;
@@ -1052,17 +1222,11 @@ main(int argc, char *argv[]) {
             gst_uri_unref(uri);
         }
         WebRTC_Launch_Task *webRTC_launch_task = new WebRTC_Launch_Task();
-        std::thread th(&WebRTC_Launch_Task::execute, webRTC_launch_task, peer_id);
+        std::thread th(&WebRTC_Launch_Task::execute, webRTC_launch_task, webrtcViewerObj);
         th.detach();
+        pipelineHandler.peers.push_back(webrtcViewerObj);
     }
 
-    stop_recording_video();
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    //gst_object_unref (bus);
-    if (pipe1) {
-        gst_element_set_state(GST_ELEMENT (pipe1), GST_STATE_NULL);
-        g_print("Pipeline stopped\n");
-        gst_object_unref(pipe1);
-    }
+    pipelineHandler.stop_streaming();
     return 0;
 }

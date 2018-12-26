@@ -2,6 +2,8 @@
 #include <memory>
 #include <gst/gst.h>
 #include <glib.h>
+#include <string>
+#include <regex>
 
 /*int main() {
     std::cout << "Hello, World!" << std::endl;
@@ -14,19 +16,29 @@ static gboolean bus_call (GstBus *bus, GstMessage *msg, gpointer data);
 
 int main (int argc, char *argv[])
 {
-    GMainLoop *loop;
+
+
+    std::string test_string = "96 packetization-mode=1;profile-level-id=4d401f;sprop-parameter-sets=Z01AH+iAKALdgLUBAQFAAAADAEAAAA8DxgxEgA==,aOuvIA==";
+    std::cout << "Actual" << std::endl;
+    std::cout << test_string << std::endl;
+    test_string = std::regex_replace(test_string, std::regex("profile-level-id=*[A-za-z0-9]*;"), "profile-level-id=42e01f;");
+    std::cout << "After" << std::endl;
+    std::cout << test_string << std::endl;
+
+
+    /*GMainLoop *loop;
 
     GstElement *pipeline, *videotestsrcm, *autovideosinkm;
     GstBus *bus;
     guint bus_watch_id;
 
-    /* Initialisation */
+    *//* Initialisation *//*
     gst_init (&argc, &argv);
 
     loop = g_main_loop_new (NULL, FALSE);
 
 
-    /* Create gstreamer elements */
+    *//* Create gstreamer elements *//*
     pipeline = gst_pipeline_new ("videotest-pipeline");
     videotestsrcm   = gst_element_factory_make ("videotestsrc", "testsource");
     autovideosinkm = gst_element_factory_make ("autovideosink", "videosink");
@@ -36,41 +48,41 @@ int main (int argc, char *argv[])
         return -1;
     }
 
-    /* Set up the pipeline */
+    *//* Set up the pipeline *//*
 
-    /* we add a message handler */
+    *//* we add a message handler *//*
     bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
     bus_watch_id = gst_bus_add_watch (bus, bus_call, loop);
     gst_object_unref (bus);
 
 
-    /* we add all elements into the pipeline */
+    *//* we add all elements into the pipeline *//*
     gst_bin_add_many (GST_BIN (pipeline),
                       videotestsrcm, autovideosinkm, NULL);
 
-    /* we link the elements together */
-    /* videotestsrcm -> autovideosinkm */
+    *//* we link the elements together *//*
+    *//* videotestsrcm -> autovideosinkm *//*
     gst_element_link (videotestsrcm, autovideosinkm);
 
 
-    /* Set the pipeline to "playing" state*/
+    *//* Set the pipeline to "playing" state*//*
     g_print ("Now set pipeline in state playing");
     gst_element_set_state (pipeline, GST_STATE_PLAYING);
 
 
-    /* Iterate */
+    *//* Iterate *//*
     g_print ("Running...\n");
     g_main_loop_run (loop);
 
 
-    /* Out of the main loop, clean up nicely */
+    *//* Out of the main loop, clean up nicely *//*
     g_print ("Returned, stopping playback\n");
     gst_element_set_state (pipeline, GST_STATE_NULL);
 
     g_print ("Deleting pipeline\n");
     gst_object_unref (GST_OBJECT (pipeline));
     g_source_remove (bus_watch_id);
-    g_main_loop_unref (loop);
+    g_main_loop_unref (loop);*/
 
     return 0;
 }
