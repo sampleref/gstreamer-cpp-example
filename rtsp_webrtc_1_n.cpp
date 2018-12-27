@@ -2,9 +2,7 @@
  * Demo gstreamer app for negotiating and streaming a sendrecv webrtc stream
  * with a browser JS app.
  *
- * gcc webrtc-sendrecv.c $(pkg-config --cflags --libs gstreamer-webrtc-1.0 gstreamer-sdp-1.0 libsoup-2.4 json-glib-1.0) -o webrtc-sendrecv
  *
- * Author: Nirbheek Chauhan <nirbheek@centricular.com>
  */
 #include <gst/gst.h>
 #include <gst/sdp/sdp.h>
@@ -442,13 +440,11 @@ void WebrtcViewer::remove_peer_from_pipeline(void) {
     if (webrtc1) {
         gst_object_unref(webrtc1);
     }
-    if (pipeline) {
-        gst_object_unref(pipeline);
-    }
 
     webrtc = gst_bin_get_by_name(GST_BIN (pipeline), this->peer_id.c_str());
     if (webrtc) {
         g_print("Removing existing webrtcbin for remote peer %s \n", this->peer_id.c_str());
+        gst_element_set_state(webrtc, GST_STATE_NULL);
         gst_bin_remove(GST_BIN (pipeline), webrtc);
         gst_object_unref(webrtc);
     }
@@ -457,6 +453,7 @@ void WebrtcViewer::remove_peer_from_pipeline(void) {
     rtph264pay = gst_bin_get_by_name(GST_BIN (pipeline), tmp);
     g_free(tmp);
     if (rtph264pay) {
+        gst_element_set_state(rtph264pay, GST_STATE_NULL);
         gst_bin_remove(GST_BIN(pipeline), rtph264pay);
         gst_object_unref(rtph264pay);
     }
@@ -488,7 +485,6 @@ void WebrtcViewer::remove_peer_from_pipeline(void) {
 
     if (loop) {
         g_main_quit(this->loop);
-        g_object_unref(this->loop);
     }
 
     if (send_channel)
@@ -927,7 +923,7 @@ public:
         webrtcViewer->connect_to_websocket_server_async();
         g_main_loop_run(loop);
         g_main_context_pop_thread_default(async_context);
-        g_main_loop_unref(loop);
+        //g_main_loop_unref(loop); // As already quit is issued on this loop, no need to unref
         g_main_context_unref(async_context);
         g_print("WebRTC_Launch_Task:execute Exited for remote peer %s\n", webrtcViewer->peer_id.c_str());
     }
@@ -1102,13 +1098,9 @@ static gboolean pipeline_bus_callback(GstBus *bus, GstMessage *message, gpointer
             break;
         }
         case GST_MESSAGE_EOS: {
-            GError *err;
-            gchar *debug;
-            gst_message_parse_error(message, &err, &debug);
-            g_print("pipeline_bus_callback:GST_MESSAGE_ERROR Error/code : %s/%d\n", err->message, err->code);
-            g_error_free(err);
-            g_free(debug);
-            break;
+            g_print("pipeline_bus_callback:GST_MESSAGE_EOS \n");
+            //pause_play_pipeline(data);
+            return FALSE;
         }
         default: {
             //g_print("pipeline_bus_callback:default Got %s message \n", GST_MESSAGE_TYPE_NAME (message));
@@ -1188,15 +1180,17 @@ gboolean RtspPipelineHandler::stop_streaming() {
     }
 
     peers.clear();
+    gst_element_send_event(pipeline, gst_event_new_eos());
     g_print("Removed peers for pipeline \n");
 
     std::this_thread::sleep_for(std::chrono::seconds(2));
     if (pipeline) {
+        g_print("Pipeline Ref Count %d\n", GST_OBJECT_REFCOUNT_VALUE(pipeline));
+        gst_element_set_state(GST_ELEMENT (pipeline), GST_STATE_PAUSED);
         gst_element_set_state(GST_ELEMENT (pipeline), GST_STATE_NULL);
-        g_print("Pipeline stopped for rtsp url %s\n", rtsp_url.c_str());
         gst_object_unref(pipeline);
+        g_print("Pipeline stopped for rtsp url %s\n", rtsp_url.c_str());
     }
-
     return TRUE;
 }
 
@@ -1280,7 +1274,12 @@ main(int argc, char *argv[]) {
         }
         add_webrtc_peer(rtspPipelineHandlerPtr, peer_id);
     }
-    //add_webrtc_peer(rtspPipelineHandlerPtr, "4615");
+
+    //To test with single peer - debugging
+    /*
+    add_webrtc_peer(rtspPipelineHandlerPtr, "5338");
+    while (true){}
+     */
     rtspPipelineHandlerPtr->stop_streaming();
     return 0;
 }
