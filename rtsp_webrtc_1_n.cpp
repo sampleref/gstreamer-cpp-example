@@ -45,6 +45,8 @@ const bool CHANGE_PROFILE_LEVEL_ID = true;
 const std::string BASE_RECORDING_PATH = "/home/kantipud/videos/";
 const std::string SIGNAL_SERVER = "wss://127.0.0.1:8443";
 
+const std::string DEFAULT_RTSP_URL = "rtsp://127.0.0.1:8554/test";
+
 #define STUN_SERVER " stun-server=stun://stun.l.google.com:19302 "
 #define RTP_CAPS_OPUS "application/x-rtp,media=audio,encoding-name=OPUS,payload="
 #define RTP_CAPS_VP8 "application/x-rtp,media=video,encoding-name=VP8,payload="
@@ -1040,8 +1042,8 @@ static void start_recording_video(std::string file_path, GstElement *pipe1) {
     g_print("Recording file to %s\n", file_path.c_str());
 }
 
-static gboolean check_rtsp_socket() {
-    g_print("Checking rtsp connection \n");
+static gboolean check_rtsp_socket(std::string rtsp_url) {
+    g_print("Checking rtsp connection for %s \n", rtsp_url.c_str());
     int CreateSocket = 0, n = 0;
     char dataReceived[1024];
     struct sockaddr_in ipOfServer;
@@ -1053,9 +1055,33 @@ static gboolean check_rtsp_socket() {
         return 1;
     }
 
+    size_t found = rtsp_url.find_first_of(":");
+    std::string protocol = rtsp_url.substr(0, found);
+    std::string expected_protocol = "rtsp";
+    if (expected_protocol.compare(protocol) != 0) {
+        printf("Not a rtsp url \n");
+        return false;
+    }
+    std::string url_new = rtsp_url.substr(found + 3); //url_new is the url excluding the rtsp part
+    size_t found1 = url_new.find_first_of("/");
+    std::string host_ip_port = url_new.substr(0, found1);
+
+    g_print("Resolved host port is %s\n", host_ip_port.c_str());
+    if (host_ip_port.find(':') != std::string::npos) {
+        size_t found = host_ip_port.find_first_of(":");
+        std::string host_ip = host_ip_port.substr(0, found);
+        ipOfServer.sin_addr.s_addr = inet_addr(host_ip.c_str());
+        size_t found_end = host_ip_port.find_first_of("/");
+        std::string host_port = host_ip_port.substr(++found, found_end);
+        ipOfServer.sin_port = htons(atoi(host_port.c_str()));
+        g_print("IP and Port resolved as %s and %s \n", host_ip.c_str(), host_port.c_str());
+    } else {
+        ipOfServer.sin_addr.s_addr = inet_addr(host_ip_port.c_str());
+        ipOfServer.sin_port = htons(554); //Default RTSP port
+        g_print("IP and Port resolved as %s and %d \n", host_ip_port.c_str(), 554);
+    }
+
     ipOfServer.sin_family = AF_INET;
-    ipOfServer.sin_port = htons(8554);
-    ipOfServer.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     if (connect(CreateSocket, (struct sockaddr *) &ipOfServer, sizeof(ipOfServer)) < 0) {
         printf("Connection failed \n");
@@ -1074,7 +1100,7 @@ static void pause_play_pipeline(gpointer data) {
             g_printerr("pause_play_pipeline: Unable to set the pipeline to the NULL state.\n");
         }
     }
-    while (!check_rtsp_socket()) {
+    while (!check_rtsp_socket(pipelineHandler->rtsp_url)) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
     pipelineHandler->start_streaming();
@@ -1189,6 +1215,7 @@ gboolean RtspPipelineHandler::stop_streaming() {
         gst_element_set_state(GST_ELEMENT (pipeline), GST_STATE_PAUSED);
         gst_element_set_state(GST_ELEMENT (pipeline), GST_STATE_NULL);
         gst_object_unref(pipeline);
+        g_clear_object (&pipeline);
         g_print("Pipeline stopped for rtsp url %s\n", rtsp_url.c_str());
     }
     return TRUE;
@@ -1236,8 +1263,8 @@ main(int argc, char *argv[]) {
     cout << "Please enter rtsp url";
     //getline(cin, rtsp_url);
     if (rtsp_url == "") {
-        g_print("Using default rtsp url %s\n", "rtsp://127.0.0.1:8554/test");
-        rtsp_url.assign("rtsp://127.0.0.1:8554/test");
+        g_print("Using default rtsp url %s\n", DEFAULT_RTSP_URL.c_str());
+        rtsp_url.assign(DEFAULT_RTSP_URL);
     } else {
         g_print("Using rtsp url %s\n", rtsp_url.c_str());
     }
