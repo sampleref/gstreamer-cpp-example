@@ -42,10 +42,12 @@ const std::string PROFILE_LEVEL_ID_REGEX = "profile-level-id=*[A-za-z0-9]*;";
 const std::string H264_BROWSER_PROFILE_LEVEL_ID = "profile-level-id=42e01f;";
 const bool CHANGE_PROFILE_LEVEL_ID = true;
 
-const std::string BASE_RECORDING_PATH = "/home/kantipud/videos/";
+const std::string BASE_RECORDING_PATH = "/home/user/videos/";
 const std::string SIGNAL_SERVER = "wss://127.0.0.1:8443";
 
-const std::string DEFAULT_RTSP_URL = "rtsp://127.0.0.1:8554/test";
+const std::string DEFAULT_RTSP_URL = "rtsp://192.168.0.10/z3-1.mp4";
+const bool FROM_PCAP = false;
+const std::string PEER_ID = "1925";
 
 #define STUN_SERVER " stun-server=stun://stun.l.google.com:19302 "
 #define RTP_CAPS_OPUS "application/x-rtp,media=audio,encoding-name=OPUS,payload="
@@ -73,6 +75,14 @@ enum AppState {
     PEER_CALL_ERROR,
 };
 
+enum PipelineState {
+    STARTED = 0,
+    PLAYING = 1,
+    ERROR = 2,
+    PAUSED = 3,
+    STOPPED = 4,
+};
+
 class WebrtcViewer {
 
 public:
@@ -80,7 +90,6 @@ public:
     GstElement *pipeline;
     GstElement *webrtc1;
     GMainLoop *loop;
-    GObject *send_channel, *receive_channel;
     SoupSession *session;
     SoupWebsocketConnection *ws_conn = NULL;
     enum AppState app_state = APP_STATE_UNKNOWN;
@@ -114,10 +123,11 @@ public:
     std::string rtsp_url;
     int pipeline_execution_id;
     int current_file_index = 0;
+    PipelineState pipelineState = STARTED;
     std::map<std::string, WebrtcViewerPtr> peers; //Connected webrtc peers with key as remote peer id
 
     //Methods
-    gboolean start_streaming(void);
+    gboolean start_streaming();
 
     gboolean stop_streaming(void);
 
@@ -128,6 +138,8 @@ public:
 typedef std::shared_ptr<RtspPipelineHandler> RtspPipelineHandlerPtr;
 
 static std::map<int, RtspPipelineHandlerPtr> pipelineHandlers;
+
+void add_webrtc_peer(RtspPipelineHandler *pipelineHandlerPtr, std::string peer_id);
 
 void WebrtcViewer::remove_webrtc_peer_from_pipelinehandler_map() {
     auto it_pipeline = pipelineHandlers.find(pipeline_execution_id);
@@ -410,12 +422,6 @@ connect_data_channel_signals(GObject *data_channel) {
                       NULL);
 }
 
-static void
-on_data_channel(GstElement *webrtc, GObject *data_channel, gpointer user_data) {
-    connect_data_channel_signals(data_channel);
-    static_cast<WebrtcViewer *>(user_data)->receive_channel = data_channel;
-}
-
 void WebrtcViewer::close_peer_from_server(void) {
     g_print("Closing peer connection from server for: %s\n", peer_id.c_str());
     if (session) {
@@ -489,9 +495,6 @@ void WebrtcViewer::remove_peer_from_pipeline(void) {
         g_main_quit(this->loop);
     }
 
-    if (send_channel)
-        g_object_unref(send_channel);
-
     g_print("Removed webrtcbin peer for remote peer : %s\n", this->peer_id.c_str());
     remove_webrtc_peer_from_pipelinehandler_map();
 }
@@ -515,7 +518,8 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     //Create rtph264depay with caps
     tmp = g_strdup_printf("rtph264pay-%s", this->peer_id.c_str());
     rtph264pay = gst_element_factory_make("rtph264pay", tmp);
-    g_object_set(rtph264pay, "config-interval", 1, NULL);
+    g_object_set(rtph264pay, "config-interval", -1, NULL);
+    g_object_set(rtph264pay, "pt", 96, NULL);
     g_free(tmp);
     srcpad = gst_element_get_static_pad(rtph264pay, "src");
     caps = gst_caps_from_string(RTP_CAPS_H264);
@@ -584,19 +588,6 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
         g_array_unref(transceivers);
     }
 
-    g_signal_emit_by_name(webrtc1, "create-data-channel", "channel", NULL,
-                          &send_channel);
-
-
-    if (send_channel) {
-        g_print("Created data channel\n");
-        connect_data_channel_signals(send_channel);
-    } else {
-        g_print("Could not create data channel, is usrsctp available?\n");
-    }
-
-    g_signal_connect (webrtc1, "on-data-channel", G_CALLBACK(on_data_channel),
-                      this);
     /* Incoming streams will be exposed via this signal */
     g_signal_connect (webrtc1, "pad-added", G_CALLBACK(on_incoming_stream),
                       pipeline);
@@ -1094,6 +1085,11 @@ static gboolean check_rtsp_socket(std::string rtsp_url) {
 static void pause_play_pipeline(gpointer data) {
     RtspPipelineHandler *pipelineHandler = static_cast<RtspPipelineHandler *>(data);
 
+    if (pipelineHandler->pipelineState != PLAYING) {
+        return;
+    }
+    pipelineHandler->pipelineState = PAUSED;
+
     if (pipelineHandler->stop_streaming()) {
         GstStateChangeReturn ret = gst_element_set_state(pipelineHandler->pipeline, GST_STATE_NULL);
         if (ret == GST_STATE_CHANGE_FAILURE) {
@@ -1125,7 +1121,7 @@ static gboolean pipeline_bus_callback(GstBus *bus, GstMessage *message, gpointer
         }
         case GST_MESSAGE_EOS: {
             g_print("pipeline_bus_callback:GST_MESSAGE_EOS \n");
-            //pause_play_pipeline(data);
+            pause_play_pipeline(data);
             return FALSE;
         }
         default: {
@@ -1145,9 +1141,16 @@ gboolean RtspPipelineHandler::start_streaming() {
      * streams, so we use a separate webrtcbin for each peer, but all of them are
      * inside the same pipeline. We start by connecting it to a fakesink so that
      * we can preroll early. */
-    std::string pipeline_string = string("tee name=videotee ! queue ! fakesink ") +
-                                  string("rtspsrc name=rtspsource location=" + rtsp_url +
-                                         " latency=10 drop-on-latency=TRUE ! rtph264depay name=rtspdepay ! videotee. ");
+    std::string pipeline_string = "";
+    if (FROM_PCAP) {
+        pipeline_string = string("tee name=videotee ! queue ! fakesink ") +
+                          string("filesrc location=/home/kantipud/videos/enp0s25.pcap ! pcapparse src-ip=192.168.0.10 src-port=41636 ! ") +
+                          string(" application/x-rtp,payload=96 ! rtph264depay name=rtspdepay ! videotee. ");
+    } else {
+        pipeline_string = string("tee name=videotee ! queue ! fakesink ") +
+                          string("rtspsrc name=rtspsource location=" + rtsp_url +
+                                 " latency=100 drop-on-latency=TRUE ! rtph264depay name=rtspdepay ! videotee. ");
+    }
 
     pipeline = gst_parse_launch(pipeline_string.c_str(), &error);
 
@@ -1165,11 +1168,17 @@ gboolean RtspPipelineHandler::start_streaming() {
     start_recording_video(prepare_next_file_name(), pipeline); //Need to check this
 
     g_print("Starting pipeline, not transmitting yet\n");
+    if (FROM_PCAP) {
+        add_webrtc_peer(this, PEER_ID);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        g_print("start_streaming triggered add_webrtc_peer\n");
+    }
     ret = gst_element_set_state(GST_ELEMENT (pipeline), GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE)
         goto err;
 
     g_print("Started pipeline, try adding peers \n");
+    pipelineState = PLAYING;
     return TRUE;
 
     err:
@@ -1221,7 +1230,7 @@ gboolean RtspPipelineHandler::stop_streaming() {
     return TRUE;
 }
 
-static void add_webrtc_peer(RtspPipelineHandlerPtr pipelineHandlerPtr, std::string peer_id) {
+void add_webrtc_peer(RtspPipelineHandler *pipelineHandlerPtr, std::string peer_id) {
     WebrtcViewerPtr webrtcViewerPtr = std::make_shared<WebrtcViewer>();
     webrtcViewerPtr->peer_id = peer_id;
     webrtcViewerPtr->pipeline = pipelineHandlerPtr->pipeline;
@@ -1260,7 +1269,7 @@ main(int argc, char *argv[]) {
 
     //Take input rtsp
     std::string rtsp_url;
-    cout << "Please enter rtsp url";
+    //cout << "Please enter rtsp url";
     //getline(cin, rtsp_url);
     if (rtsp_url == "") {
         g_print("Using default rtsp url %s\n", DEFAULT_RTSP_URL.c_str());
@@ -1271,7 +1280,7 @@ main(int argc, char *argv[]) {
 
     //take input device name
     std::string device_name;
-    cout << "Please enter device name";
+    //cout << "Please enter device name";
     //getline(cin, device_name);
 
     //Start base pipeline
@@ -1299,7 +1308,7 @@ main(int argc, char *argv[]) {
             break;
             //return 0;
         }
-        add_webrtc_peer(rtspPipelineHandlerPtr, peer_id);
+        add_webrtc_peer(rtspPipelineHandlerPtr.get(), peer_id);
     }
 
     //To test with single peer - debugging
