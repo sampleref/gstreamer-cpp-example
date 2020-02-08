@@ -42,18 +42,22 @@ const std::string PROFILE_LEVEL_ID_REGEX = "profile-level-id=*[A-za-z0-9]*;";
 const std::string H264_BROWSER_PROFILE_LEVEL_ID = "profile-level-id=42e01f;";
 const bool CHANGE_PROFILE_LEVEL_ID = true;
 
-const std::string BASE_RECORDING_PATH = "/home/user/videos/";
-const std::string SIGNAL_SERVER = "wss://127.0.0.1:8443";
+const std::string BASE_RECORDING_PATH = "/mnt/av/";
+const std::string SIGNAL_SERVER = "wss://10.142.148.236:8443";
 
-const std::string DEFAULT_RTSP_URL = "rtsp://192.168.0.10/z3-1.mp4";
+const std::string DEFAULT_RTSP_URL = "rtsp://10.142.138.174/z3-1.mp4";
 const bool FROM_PCAP = false;
-const std::string PEER_ID = "1925";
+const std::string PCAP_PATH = "";
+const std::string PCAP_SRC_IP = "192.168.0.10";
+const std::string PCAP_SRC_PORT = "56598";
+const std::string PEER_ID = "5426";
 
 #define STUN_SERVER " stun-server=stun://stun.l.google.com:19302 "
 #define RTP_CAPS_OPUS "application/x-rtp,media=audio,encoding-name=OPUS,payload="
 #define RTP_CAPS_VP8 "application/x-rtp,media=video,encoding-name=VP8,payload="
 #define RTP_CAPS_H264 "application/x-rtp,media=video,encoding-name=H264,payload=96"
 
+int current_file_index = 0;
 
 enum AppState {
     APP_STATE_UNKNOWN = 0,
@@ -89,6 +93,7 @@ public:
     //Attributes
     GstElement *pipeline;
     GstElement *webrtc1;
+    GObject *send_channel, *receive_channel;
     GMainLoop *loop;
     SoupSession *session;
     SoupWebsocketConnection *ws_conn = NULL;
@@ -134,6 +139,14 @@ public:
     std::string prepare_next_file_name(void);
 
 };
+
+class RtspServerHandler {
+
+public:
+
+};
+
+typedef std::shared_ptr<RtspServerHandler> RtspServerHandlerPtr;
 
 typedef std::shared_ptr<RtspPipelineHandler> RtspPipelineHandlerPtr;
 
@@ -411,15 +424,21 @@ data_channel_on_message_string(GObject *dc, gchar *str, gpointer user_data) {
 }
 
 static void
-connect_data_channel_signals(GObject *data_channel) {
+connect_data_channel_signals(GObject *data_channel, WebrtcViewer *webrtcViewer) {
     g_signal_connect (data_channel, "on-error", G_CALLBACK(data_channel_on_error),
-                      NULL);
+                      webrtcViewer);
     g_signal_connect (data_channel, "on-open", G_CALLBACK(data_channel_on_open),
-                      NULL);
+                      webrtcViewer);
     g_signal_connect (data_channel, "on-close", G_CALLBACK(data_channel_on_close),
-                      NULL);
+                      webrtcViewer);
     g_signal_connect (data_channel, "on-message-string", G_CALLBACK(data_channel_on_message_string),
-                      NULL);
+                      webrtcViewer);
+}
+
+static void
+on_data_channel(GstElement *webrtc, GObject *data_channel, WebrtcViewer *webrtcViewer) {
+    connect_data_channel_signals(data_channel, webrtcViewer);
+    webrtcViewer->receive_channel = data_channel;
 }
 
 void WebrtcViewer::close_peer_from_server(void) {
@@ -513,6 +532,7 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     //Create queue
     tmp = g_strdup_printf("queue-%s", this->peer_id.c_str());
     queue = gst_element_factory_make("queue", tmp);
+    g_object_set(queue, "leaky", 2, NULL);
     g_free(tmp);
 
     //Create rtph264depay with caps
@@ -520,6 +540,7 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     rtph264pay = gst_element_factory_make("rtph264pay", tmp);
     g_object_set(rtph264pay, "config-interval", -1, NULL);
     g_object_set(rtph264pay, "pt", 96, NULL);
+    //g_object_set(rtph264pay, "mtu", 1000, NULL);
     g_free(tmp);
     srcpad = gst_element_get_static_pad(rtph264pay, "src");
     caps = gst_caps_from_string(RTP_CAPS_H264);
@@ -528,7 +549,12 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
     gst_object_unref(srcpad);
 
     //Create webrtcbin
+    /*GST_WEBRTC_BUNDLE_POLICY_NONE - Default,
+    GST_WEBRTC_BUNDLE_POLICY_BALANCED,
+    GST_WEBRTC_BUNDLE_POLICY_MAX_COMPAT,
+    GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE,*/
     this->webrtc1 = gst_element_factory_make("webrtcbin", this->peer_id.c_str());
+    g_object_set(this->webrtc1, "bundle-policy", 3, NULL);
 
     //Add elements to pipeline
     gst_bin_add_many(GST_BIN (pipeline), queue, rtph264pay, this->webrtc1, NULL);
@@ -577,6 +603,18 @@ gboolean WebrtcViewer::start_webrtcbin(void) {
      * added by us too, see on_server_message() */
     g_signal_connect (webrtc1, "on-ice-candidate",
                       G_CALLBACK(send_ice_candidate_message), this);
+
+    /*g_signal_emit_by_name(webrtc1, "create-data-channel", "channel", NULL,
+                          &send_channel);
+    if (send_channel) {
+        g_print("Created data channel\n");
+        connect_data_channel_signals(send_channel, this);
+    } else {
+        g_print("Could not create data channel, is usrsctp available?\n");
+    }
+
+    g_signal_connect (webrtc1, "on-data-channel", G_CALLBACK(on_data_channel),
+                      this);*/
 
     //Change webrtcbin to send only
     g_signal_emit_by_name(webrtc1, "get-transceivers", &transceivers);
@@ -665,8 +703,7 @@ on_server_closed(SoupWebsocketConnection *conn G_GNUC_UNUSED,
 static void
 on_server_message(SoupWebsocketConnection *conn, SoupWebsocketDataType type,
                   GBytes *message, gpointer user_data) {
-    gsize size;
-    gchar *text, *data;
+    gchar *text;
     WebrtcViewer *webrtcViewer = static_cast<WebrtcViewer *>(user_data);
     switch (type) {
         case SOUP_WEBSOCKET_DATA_BINARY:
@@ -674,10 +711,9 @@ on_server_message(SoupWebsocketConnection *conn, SoupWebsocketDataType type,
             return;
         case SOUP_WEBSOCKET_DATA_TEXT: {
             gsize size;
-            data = static_cast<gchar *>(g_bytes_unref_to_data(message, &size));
+            const gchar *data = static_cast<gchar *>(g_bytes_unref_to_data (message, &size));
             /* Convert to NULL-terminated string */
             text = g_strndup(data, size);
-            g_free(data);
             break;
         }
         default:
@@ -943,12 +979,35 @@ std::string RtspPipelineHandler::prepare_next_file_name(void) {
     return file_name;
 }
 
+std::string prepare_next_file_name(void) {
+    std::string file_name;
+
+    file_name = "testvideo";
+    file_name.insert(0, BASE_RECORDING_PATH);
+    file_name.append("-" + std::to_string(++current_file_index) + "__");
+    file_name.append(std::to_string(generate_random_int()));
+    file_name.append(".mp4");
+    g_print("New recording file name generated as: %s \n", file_name.c_str());
+    return file_name;
+}
+
+gchar *splitmuxsink_on_format_location_full(GstElement *splitmux,
+                                            guint fragment_id,
+                                            GstSample *first_sample,
+                                            gpointer user_data) {
+    g_print("Requesting new file path for device recording \n");
+    std::string nextfilename = prepare_next_file_name().c_str();
+    g_print("New file name generated for recording as %s \n",
+            nextfilename.c_str());
+    return g_strdup_printf("%s", nextfilename.c_str());
+}
+
 static void start_recording_video(std::string file_path, GstElement *pipe1) {
     g_print("start_recording_video file to %s\n", file_path.c_str());
 
     int ret;
     gchar *tmp;
-    GstElement *tee, *queue, *h264parse, *mp4mux, *filesink;
+    GstElement *tee, *queue, *h264parse, *mp4mux, *splitmuxsink;
     GstPad *srcpad, *sinkpad;
 
     //Create queue
@@ -965,16 +1024,23 @@ static void start_recording_video(std::string file_path, GstElement *pipe1) {
     //Create mp4mux
     tmp = g_strdup_printf("mp4mux-%s", "recorder");
     mp4mux = gst_element_factory_make("mp4mux", tmp);
+    g_object_set(mp4mux, "reserved-bytes-per-sec", 5000, NULL);
+    g_object_set(mp4mux, "reserved-max-duration", (2 * GST_SECOND), NULL);
+    g_object_set(mp4mux, "reserved-moov-update-period", (30 * GST_SECOND), NULL);
     g_free(tmp);
 
     //Create filesink
     tmp = g_strdup_printf("filesink-%s", "recorder");
-    filesink = gst_element_factory_make("filesink", tmp);
-    g_object_set(filesink, "location", file_path.c_str(), NULL);
+    splitmuxsink = gst_element_factory_make("splitmuxsink", tmp);
+    g_object_set(splitmuxsink, "muxer", mp4mux, NULL);
+    g_object_set(splitmuxsink, "max-size-time", (180 * GST_SECOND), NULL);
+    g_object_set(splitmuxsink, "use-robust-muxing", TRUE, NULL);
+    g_signal_connect(splitmuxsink, "format-location-full",
+                     G_CALLBACK(splitmuxsink_on_format_location_full), NULL);
     g_free(tmp);
 
     //Add elements to pipeline
-    gst_bin_add_many(GST_BIN (pipe1), queue, h264parse, mp4mux, filesink, NULL);
+    gst_bin_add_many(GST_BIN (pipe1), queue, h264parse, splitmuxsink, NULL);
 
     //Link queue -> h264parse
     srcpad = gst_element_get_static_pad(queue, "src");
@@ -986,20 +1052,10 @@ static void start_recording_video(std::string file_path, GstElement *pipe1) {
     gst_object_unref(srcpad);
     gst_object_unref(sinkpad);
 
-    //Link h264parse -> mp4mux
+    //Link h264parse -> splitmuxsink
     srcpad = gst_element_get_static_pad(h264parse, "src");
     g_assert_nonnull (srcpad);
-    sinkpad = gst_element_get_request_pad(mp4mux, "video_%u");
-    g_assert_nonnull (sinkpad);
-    ret = gst_pad_link(srcpad, sinkpad);
-    g_assert_cmpint (ret, ==, GST_PAD_LINK_OK);
-    gst_object_unref(srcpad);
-    gst_object_unref(sinkpad);
-
-    //Link mp4mux -> filesink
-    srcpad = gst_element_get_static_pad(mp4mux, "src");
-    g_assert_nonnull (srcpad);
-    sinkpad = gst_element_get_static_pad(filesink, "sink");
+    sinkpad = gst_element_get_request_pad(splitmuxsink, "video");
     g_assert_nonnull (sinkpad);
     ret = gst_pad_link(srcpad, sinkpad);
     g_assert_cmpint (ret, ==, GST_PAD_LINK_OK);
@@ -1019,15 +1075,13 @@ static void start_recording_video(std::string file_path, GstElement *pipe1) {
     gst_object_unref(srcpad);
     gst_object_unref(sinkpad);
 
-    g_assert_nonnull (filesink);
+    g_assert_nonnull (splitmuxsink);
 
     ret = gst_element_sync_state_with_parent(queue);
     g_assert_true (ret);
     ret = gst_element_sync_state_with_parent(h264parse);
     g_assert_true (ret);
-    ret = gst_element_sync_state_with_parent(mp4mux);
-    g_assert_true (ret);
-    ret = gst_element_sync_state_with_parent(filesink);
+    ret = gst_element_sync_state_with_parent(splitmuxsink);
     g_assert_true (ret);
 
     g_print("Recording file to %s\n", file_path.c_str());
@@ -1109,7 +1163,7 @@ static gboolean pipeline_bus_callback(GstBus *bus, GstMessage *message, gpointer
             gchar *debug;
             gst_message_parse_error(message, &err, &debug);
             g_print("pipeline_bus_callback:GST_MESSAGE_ERROR Error/code : %s/%d\n", err->message, err->code);
-            if (err->code == 7) {
+            if (err->code > 0) {
                 pause_play_pipeline(data);
                 g_error_free(err);
                 g_free(debug);
@@ -1144,12 +1198,15 @@ gboolean RtspPipelineHandler::start_streaming() {
     std::string pipeline_string = "";
     if (FROM_PCAP) {
         pipeline_string = string("tee name=videotee ! queue ! fakesink ") +
-                          string("filesrc location=/home/kantipud/videos/enp0s25.pcap ! pcapparse src-ip=192.168.0.10 src-port=41636 ! ") +
+                          string("filesrc location=") + PCAP_PATH +
+                          string(" ! pcapparse src-ip=") + PCAP_SRC_IP +
+                          string(" src-port=") + PCAP_SRC_PORT +
+                          string(" ! ") +
                           string(" application/x-rtp,payload=96 ! rtph264depay name=rtspdepay ! videotee. ");
     } else {
-        pipeline_string = string("tee name=videotee ! queue ! fakesink ") +
+        pipeline_string = string("tee name=videotee allow-not-linked=true ") +
                           string("rtspsrc name=rtspsource location=" + rtsp_url +
-                                 " latency=100 drop-on-latency=TRUE ! rtph264depay name=rtspdepay ! videotee. ");
+                                 " latency=100 drop-on-latency=TRUE ! watchdog timeout=5000 ! rtph264depay name=rtspdepay ! videotee. ");
     }
 
     pipeline = gst_parse_launch(pipeline_string.c_str(), &error);
@@ -1169,7 +1226,14 @@ gboolean RtspPipelineHandler::start_streaming() {
 
     g_print("Starting pipeline, not transmitting yet\n");
     if (FROM_PCAP) {
-        add_webrtc_peer(this, PEER_ID);
+        std::string peer_id;
+        cout << "Please enter peer id \n";
+        getline(cin, peer_id);
+        if (peer_id == "") {
+            add_webrtc_peer(this, PEER_ID);
+        } else {
+            add_webrtc_peer(this, peer_id);
+        }
         std::this_thread::sleep_for(std::chrono::seconds(2));
         g_print("start_streaming triggered add_webrtc_peer\n");
     }
@@ -1269,8 +1333,8 @@ main(int argc, char *argv[]) {
 
     //Take input rtsp
     std::string rtsp_url;
-    //cout << "Please enter rtsp url";
-    //getline(cin, rtsp_url);
+    cout << "Please enter rtsp url \n";
+    getline(cin, rtsp_url);
     if (rtsp_url == "") {
         g_print("Using default rtsp url %s\n", DEFAULT_RTSP_URL.c_str());
         rtsp_url.assign(DEFAULT_RTSP_URL);

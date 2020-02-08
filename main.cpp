@@ -10,6 +10,19 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <x264.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/mathematics.h>
+#include <libavformat/avformat.h>
+#include <libavutil/opt.h>
+#include <libswresample/swresample.h>
+#ifdef __cplusplus
+}
+#endif
+
 /*int main() {
     std::cout << "Hello, World!" << std::endl;
     std::string str = "ls -l";
@@ -31,10 +44,19 @@ int main(int argc, char *argv[]) {
     std::cout << "After" << std::endl;
     std::cout << test_string << std::endl;*/
 
-    bool result = check_rtsp_socket("rtsp://127.0.0.1:8554/test");
+    //bool result = check_rtsp_socket("rtsp://127.0.0.1:8554/test");
     std::cout << "RTSP local Check" << std::endl;
-    std::cout << result << std::endl;
+    //std::cout << result << std::endl;
 
+    av_register_all();
+    AVCodec *codec = NULL;
+    codec = avcodec_find_encoder_by_name("libx264");
+    if(codec != NULL && codec->long_name != NULL){
+        std::string str(codec->long_name);
+        std::cout << str << std::endl;
+    } else{
+        std::cout << "Null long name" << std::endl;
+    }
 
     /*GMainLoop *loop;
 
